@@ -26,8 +26,8 @@ const ready = {
 
 // The exact effective-policy check, written out so a change to it shows up here.
 const VERIFY = '[ "$(sudo sshd -T | grep -ixcE "(passwordauthentication|kbdinteractiveauthentication) no'
-  + '|pubkeyauthentication yes|authenticationmethods (any|publickey)")" = 4 ]'
-const VERIFY_FW = VERIFY + ' || { echo "SSH does not accept keys only, so the firewall was not opened."; false; }'
+  + '|pubkeyauthentication yes|authenticationmethods (any|publickey)")" = 4 ] && ' + M.SSH_MATCH
+const VERIFY_FW = VERIFY + ' || { echo "SSH does not accept keys only (or a Match block touches sign-in), so the firewall was not opened."; false; }'
 const DROPIN = "/etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf"
 
 test("versions parse and compare", () => {
@@ -239,7 +239,7 @@ test("every ufw command is scoped to a subnet; none opens to everyone or forward
     ...M.firewallFixes("192.168.1.0/24"), ...M.closeFixes(["192.168.1.0/24"]),
     ...M.tailscaleFixes({ state: "missing" })
   ].map(f => f.cmd).join("\n")
-  assert.doesNotMatch(everything, /upnp|forward|iptables|sshd_config|sudoers|ufw (disable|reset)/i)
+  assert.doesNotMatch(everything.replace(M.SSH_MATCH, ""), /upnp|forward|iptables|sshd_config|sudoers|ufw (disable|reset)/i)
   assert.doesNotMatch(everything, /ufw allow (22|60000)/)
 })
 
@@ -299,7 +299,7 @@ test("recorded subnets that are not canonical private subnets are dropped", () =
 
 test("firewall command text for a firewall step is shown before it runs", () => {
   const script = M.fixScript(M.nextStep(build({}), [], "lan").fixes)
-  assert.ok(script.indexOf("echo '  $ sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp'") < script.indexOf("&&"))
+  assert.ok(script.indexOf("echo '  $ sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp'") < script.indexOf(" && sudo ufw"))
 })
 
 test("tailscale mode never asks for firewall changes", () => {
@@ -372,7 +372,7 @@ test("check output carries the ssh keys", () => {
 })
 
 test("gate: password or unknown policy locks the firewall and the QR behind the key-only step", () => {
-  for (const ssh_conf of [conf("KbdInteractiveAuthentication no"), "", conf(KEYONLY, "Match all", "PasswordAuthentication yes")]) {
+  for (const ssh_conf of [conf("KbdInteractiveAuthentication no"), ""]) {
     const checks = build({ ssh_conf })
     const step = M.nextStep(checks, [], "lan")
     assert.equal(step.kind, "fix")
@@ -385,6 +385,20 @@ test("gate: password or unknown policy locks the firewall and the QR behind the 
     // Already paired phones do not skip the gate either.
     assert.equal(M.nextStep(checks, [{ id: "host_x" }], "lan").kind, "fix")
   }
+})
+
+test("gate: a Match block touching sign-in is not re-offered the same step; it asks for a manual review", () => {
+  const checks = build({ ssh_conf: conf(KEYONLY, "Match Address 192.168.0.0/16", "PasswordAuthentication yes") })
+  assert.equal(checks.ssh.policy, "match")
+  const step = M.nextStep(checks, [], "lan")
+  assert.equal(step.kind, "wait")
+  assert.match(step.hint, /Match block.*never edits it/)
+  assert.equal(step.fixes, undefined)
+  assert.equal(M.canPair(checks, "lan"), false)
+  assert.equal(M.nextStep(checks, [{ id: "host_x" }], "lan").kind, "wait")
+  assert.equal(M.checklist(checks, "lan").find(r => r.id === "sshauth").detail, "Match block: review by hand")
+  assert.equal(M.checklist(checks, "lan").find(r => r.id === "firewall").state, "wait")
+  assert.equal(M.nextStep(checks, [], "tailscale").kind, "pair")
 })
 
 test("gate: verified key-only opens the firewall step, then the QR", () => {
@@ -420,7 +434,7 @@ test("key-only step: exact commands, in order, and before sshd is started", () =
       + ' "PasswordAuthentication no" "KbdInteractiveAuthentication no" | sudo install -Dm644 /dev/stdin ' + DROPIN,
     "sudo sshd -t || { sudo rm -f " + DROPIN + '; echo "sshd rejected its configuration. Pocket Pair removed its file and changed nothing else."; false; }',
     VERIFY + " || { sudo rm -f " + DROPIN + '; echo "sshd is not keys only after all: an earlier rule overrides the Pocket Pair file,'
-      + ' or AuthenticationMethods allows more. The file was removed. Fix that rule yourself, or use Tailscale."; false; }',
+      + ' AuthenticationMethods allows more, or a Match block touches sign-in. The file was removed. Review that yourself, or use Tailscale."; false; }',
     "{ ! systemctl is-active --quiet sshd || sudo systemctl reload sshd; }",
     "sudo systemctl enable --now sshd"
   ])
@@ -431,7 +445,7 @@ test("key-only step: exact commands, in order, and before sshd is started", () =
 
 test("key-only step never edits the main sshd_config, sudoers, or limits/opens the firewall", () => {
   const all = [...M.keyOnlyFixes(), ...M.firewallFixes("192.168.1.0/24")].map(f => f.cmd).join("\n")
-  assert.doesNotMatch(all, /sshd_config(?!\.d\/10-pocket-pair-keyonly\.conf)/)
+  assert.doesNotMatch(all.replaceAll(M.SSH_MATCH, ""), /sshd_config(?!\.d\/10-pocket-pair-keyonly\.conf)/)
   assert.doesNotMatch(all, /sudoers|ufw limit|ufw allow 22|ufw allow ssh/)
   for (const cmd of M.firewallFixes("192.168.1.0/24").map(f => f.cmd).filter(c => /ufw/.test(c))) assert.match(cmd, / from 192\.168\.1\.0\/24 /)
   assert.equal(M.SSH_DROPIN, DROPIN)
@@ -446,14 +460,14 @@ test("the firewall step checks sshd -T first, so stale panel state cannot open i
 
 test("missing authorized keys: the step says nobody can sign in until the phone pairs; counts never show keys", () => {
   const none = M.nextStep(build({ ssh_conf: "", auth_keys: "0" }), [], "lan")
-  assert.match(none.hint, /No keys are in ~\/\.ssh\/authorized_keys yet, so nobody can sign in over SSH until your phone pairs\./)
-  assert.match(none.hint, /Anyone who signs in with a password today will be locked out\./)
+  assert.match(none.hint, /No keys were found in ~\/\.ssh\/authorized_keys\. Unless keys come from elsewhere \(AuthorizedKeysFile, AuthorizedKeysCommand\), nobody can sign in over SSH until your phone pairs\./)
+  assert.match(none.hint, /Anyone who signs in with a password today will stop being able to\./)
   assert.match(none.hint, /Sessions already open stay connected\./)
   assert.match(M.nextStep(build({ ssh_conf: "", auth_keys: "1" }), [], "lan").hint, /1 key is already in ~\/\.ssh\/authorized_keys and keep working\./)
   assert.match(M.nextStep(build({ ssh_conf: "", auth_keys: "4" }), [], "lan").hint, /4 keys are already in/)
   assert.match(M.nextStep(build({ ssh_conf: "", auth_keys: "unknown" }), [], "lan").hint, /could not be read/)
   // sshd is off, so no one signs in with a password today.
-  assert.doesNotMatch(M.nextStep(build({ ssh_conf: "", auth_keys: "0", sshd: "inactive" }), [], "lan").hint, /locked out/)
+  assert.doesNotMatch(M.nextStep(build({ ssh_conf: "", auth_keys: "0", sshd: "inactive" }), [], "lan").hint, /stop being able to/)
   const rows = key => M.checklist(build({ auth_keys: key }), "lan").find(r => r.id === "sshkeys").detail
   assert.deepEqual([rows("0"), rows("3"), rows("unknown")], ["none yet", "3 already", "not counted"])
 })
@@ -481,7 +495,7 @@ esac
 
 // Runs the exact key-only commands with a stand-in sudo (no privilege, paths
 // mapped under a throwaway directory), sshd and systemctl.
-function runKeyOnlyFix({ effective, testRc = 0, active = true, preexisting = false }) {
+function runKeyOnlyFix({ effective, testRc = 0, active = true, preexisting = false, sshdConfig = "" }) {
   const dir = mkdtempSync(join(tmpdir(), "pp-fix-"))
   const bin = join(dir, "bin")
   const write = (name, body) => { writeFileSync(join(bin, name), body, { mode: 0o755 }) }
@@ -489,9 +503,10 @@ function runKeyOnlyFix({ effective, testRc = 0, active = true, preexisting = fal
     mkdirSync(bin)
     mkdirSync(join(dir, "etc/ssh/sshd_config.d"), { recursive: true })
     writeFileSync(join(dir, "effective"), effective)
+    writeFileSync(join(dir, "etc/ssh/sshd_config"), sshdConfig)
     if (preexisting) writeFileSync(join(dir, "etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf"), "old\n")
-    write("sudo", `#!/bin/bash\nargs=(); for a in "$@"; do case "$a" in /etc/*) a="${dir}$a";; esac; args+=("$a"); done\n`
-      + `case "\${args[0]}" in install|rm|sshd|systemctl) exec "\${args[@]}";; *) echo "unexpected sudo $*" >&2; exit 99;; esac\n`)
+    write("sudo", `#!/bin/bash\nshopt -s nullglob\nargs=(); for a in "$@"; do case "$a" in /etc/*) for m in ${dir}$a; do [ -e "$m" ] || [ "\${args[0]:-}" != awk ] && args+=("$m"); done;; *) args+=("$a");; esac; done\n`
+      + `case "\${args[0]}" in install|rm|sshd|systemctl|awk) exec "\${args[@]}";; *) echo "unexpected sudo $*" >&2; exit 99;; esac\n`)
     write("sshd", FAKE_BIN_SSHD_T)
     write("systemctl", `#!/bin/bash\necho "systemctl $*" >> "${dir}/calls"\n`
       + `[ "$1" = is-active ] && exit ${active ? 0 : 3}\nexit 0\n`)
@@ -512,6 +527,18 @@ function runKeyOnlyFix({ effective, testRc = 0, active = true, preexisting = fal
 }
 
 const KEYONLY_T = "passwordauthentication no\nkbdinteractiveauthentication no\npubkeyauthentication yes\nauthenticationmethods any\nport 22\n"
+
+test("key-only fix: a Match block touching sign-in fails the check, removes only Pocket Pair's file and stops", () => {
+  for (const match of ["Match Address 192.168.0.0/16\n  PasswordAuthentication yes\n", "match user bob\n  AuthenticationMethods=password\n"]) {
+    const r = runKeyOnlyFix({ effective: KEYONLY_T, sshdConfig: "Port 22\n" + match })
+    assert.notEqual(r.rc, 0)
+    assert.match(r.out, /Match block touches sign-in/)
+    assert.equal(r.exists, false)
+    assert.equal(r.calls, "")
+  }
+  const harmless = runKeyOnlyFix({ effective: KEYONLY_T, sshdConfig: "Match User git\n  AllowTcpForwarding no\n" })
+  assert.equal(harmless.rc, 0, harmless.out)
+})
 
 test("key-only fix: writes the drop-in, verifies with sshd -T, then reloads a running sshd", () => {
   const r = runKeyOnlyFix({ effective: KEYONLY_T })

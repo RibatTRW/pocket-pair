@@ -91,7 +91,7 @@ QtObject {
     'echo "ssh_conf=$(bash "$2/scripts/read-sshd-config.sh" 2>/dev/null | tr "\\n" "\\037")"',
     'ak="$HOME/.ssh/authorized_keys"',
     'if [ ! -e "$ak" ]; then echo auth_keys=0',
-    'elif [ ! -r "$ak" ]; then echo auth_keys=unknown',
+    'elif [ ! -r "$ak" ] || ! command -v ssh-keygen >/dev/null 2>&1; then echo auth_keys=unknown',
     'else',
     '  n=0',
     '  while IFS= read -r l || [ -n "$l" ]; do',
