@@ -15,7 +15,7 @@ var GLYPHS = {
 
 var PAIR_SECONDS = 300
 var CHECK_KEYS = ["hook_path", "hook_version", "daemon", "mosh", "sshd", "ts_bin", "ts_status", "ts_prefs",
-  "ufw", "lan_routes", "lan_addrs", "lan_subnets"]
+  "ufw", "lan_routes", "lan_addrs", "lan_subnets", "ssh_conf", "auth_keys"]
 
 // How the phone reaches this machine: over a tailnet (recommended), or over
 // the home network when the phone is on the same Wi-Fi.
@@ -30,6 +30,12 @@ var MOSH_PORTS = "60000:61000"
 // and removed by the matching close step. It is the record of what this plugin
 // opened (no root needed to read it back, unlike `ufw status`).
 var LAN_SUBNETS = "~/.local/state/pocket-pair/lan-subnets"
+
+// The one file Pocket Pair adds to the SSH server's configuration, only in
+// home-network mode. It sorts ahead of the packaged drop-ins, and sshd keeps
+// the first value it reads, so it wins over them. The main sshd_config is never
+// edited.
+var SSH_DROPIN = "/etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf"
 
 function normalizeMode(value) {
   return String(value || "") === MODE_LAN ? MODE_LAN : MODE_TAILSCALE
@@ -190,6 +196,69 @@ function parseSubnets(text) {
   return list
 }
 
+// What the readable SSH server configuration says about signing in. `text` is
+// scripts/read-sshd-config.sh's output (Include lines already expanded in
+// place), its lines joined with U+001F so it fits on one check line.
+//
+// Returns "keyonly" only when it can be proven from that text; "password" when
+// password or keyboard-interactive login is provably on; "unknown" for
+// everything else (an unreadable file, a Match block that touches sign-in, an
+// AuthenticationMethods that is not plain publickey, an odd value). The gate
+// treats "password" and "unknown" the same: stop. The authoritative answer is
+// `sshd -T`, which the terminal steps run as root.
+//
+// sshd keeps the first value it reads for these keywords, defaults to
+// passwords on, and treats ChallengeResponseAuthentication as another name for
+// KbdInteractiveAuthentication.
+var SSH_AUTH_KEYWORDS = {
+  passwordauthentication: "password",
+  kbdinteractiveauthentication: "kbd",
+  challengeresponseauthentication: "kbd",
+  authenticationmethods: "methods",
+  pubkeyauthentication: "pubkey"
+}
+
+function parseSshPolicy(text) {
+  var lines = String(text || "").split(/[\u001f\r\n]/)
+  var first = {}
+  var inMatch = false
+  var touchedInMatch = false
+  var unresolved = lines.every(function(l) { return l.trim() === "" })
+  lines.forEach(function(raw) {
+    var line = raw.trim()
+    if (line === "" || line.charAt(0) === "#") return
+    var parsed = /^([A-Za-z0-9]+)(?:\s*=\s*|\s+)(.*)$/.exec(line)
+    if (!parsed) { unresolved = true; return }
+    var keyword = parsed[1].toLowerCase()
+    var words = parsed[2].split(/\s+/)
+    var cut = words.findIndex(function(w) { return w.charAt(0) === "#" })
+    if (cut >= 0) words = words.slice(0, cut)
+    var value = words.join(" ").replace(/^"(.*)"$/, "$1").toLowerCase()
+    if (keyword === "match") { inMatch = true; return }
+    if (keyword === "include" || keyword === "pocketpairunresolved") { unresolved = true; return }
+    var slot = SSH_AUTH_KEYWORDS[keyword]
+    if (!slot) return
+    if (inMatch) { touchedInMatch = true; return }
+    if (first[slot] === undefined) first[slot] = value
+  })
+  if (unresolved) return "unknown"
+  var password = first.password === undefined ? "yes" : first.password
+  var kbd = first.kbd === undefined ? "yes" : first.kbd
+  if (password === "yes" || kbd === "yes") return "password"
+  if (password !== "no" || kbd !== "no" || touchedInMatch) return "unknown"
+  if (first.pubkey !== undefined && first.pubkey !== "yes") return "unknown"
+  var methods = first.methods === undefined ? "any" : first.methods
+  if (methods === "any" || methods === "publickey") return "keyonly"
+  return /password|keyboard-interactive/.test(methods) ? "password" : "unknown"
+}
+
+// auth_keys is a count, or "unknown" when ~/.ssh/authorized_keys exists but
+// cannot be read. -1 means unknown. Never keys themselves.
+function parseKeyCount(value) {
+  var text = String(value === undefined ? "" : value).trim()
+  return /^\d{1,6}$/.test(text) ? parseInt(text, 10) : -1
+}
+
 function parseUfw(text) {
   var state = String(text || "").trim()
   return state === "active" ? "active" : state === "" || state === "missing" ? "missing" : "inactive"
@@ -202,6 +271,7 @@ function buildChecks(raw, latestText) {
   var present = !!raw.hook_path && version !== ""
   var lan = parseLan(raw.lan_routes, raw.lan_addrs)
   var openSubnets = parseSubnets(raw.lan_subnets)
+  var policy = parseSshPolicy(raw.ssh_conf)
   return {
     hook: {
       present: present,
@@ -213,6 +283,7 @@ function buildChecks(raw, latestText) {
     daemon: raw.daemon === "active",
     mosh: raw.mosh === "yes",
     sshd: raw.sshd === "active",
+    ssh: { policy: policy, keyOnly: policy === "keyonly", keys: parseKeyCount(raw.auth_keys) },
     tailscale: parseTailscale(raw.ts_status, raw.ts_prefs, raw.ts_bin),
     lan: lan,
     ufw: parseUfw(raw.ufw),
@@ -245,6 +316,65 @@ function tailscaleFixes(tailscale) {
   return list
 }
 
+// "Key-only" as sshd itself reports it: `sshd -T` prints the effective
+// configuration (needs root, so it runs in the terminal step). All four lines
+// must be there; a missing or different line fails the check. Match blocks are
+// not evaluated by -T, which is why the panel's own reading stays strict too.
+var SSH_VERIFY = "[ \"$(sudo sshd -T | grep -ixcE \"(passwordauthentication|kbdinteractiveauthentication) no"
+  + "|pubkeyauthentication yes|authenticationmethods (any|publickey)\")\" = 4 ]"
+
+// Every command is fixed text. A failing check removes only Pocket Pair's own
+// file again, says why, and stops the chain (the `false`), so nothing after it
+// runs. Existing SSH sessions are not cut: the reload only applies to new ones.
+function keyOnlyFixes() {
+  var remove = "sudo rm -f " + SSH_DROPIN
+  return [
+    {
+      id: "ssh-conf",
+      cmd: "printf \"%s\\n\" \"# Written by Pocket Pair: SSH accepts keys only. Delete this file and run"
+        + " sudo systemctl reload sshd to allow passwords again.\" \"PasswordAuthentication no\""
+        + " \"KbdInteractiveAuthentication no\" | sudo install -Dm644 /dev/stdin " + SSH_DROPIN,
+      why: "turn off password sign-in for SSH (keys only)"
+    },
+    {
+      id: "ssh-test",
+      cmd: "sudo sshd -t || { " + remove + "; echo \"sshd rejected its configuration. Pocket Pair removed"
+        + " its file and changed nothing else.\"; false; }",
+      why: "check sshd accepts its configuration"
+    },
+    {
+      id: "ssh-verify",
+      cmd: SSH_VERIFY + " || { " + remove + "; echo \"sshd is not keys only after all: an earlier rule overrides the"
+        + " Pocket Pair file, or AuthenticationMethods allows more. The file was removed. Fix that rule yourself, or use Tailscale.\"; false; }",
+      why: "confirm sshd really is keys only now"
+    },
+    {
+      id: "ssh-reload",
+      cmd: "{ ! systemctl is-active --quiet sshd || sudo systemctl reload sshd; }",
+      why: "apply it to new connections (open sessions stay)"
+    }
+  ]
+}
+
+// Words for the panel and for the terminal, shown before anything runs. Counts
+// only: the keys themselves are never read into the panel.
+function keyOnlyNotes(checks) {
+  var ssh = checks.ssh
+  var notes = [ssh.policy === "password"
+    ? "SSH on this machine still accepts passwords. Pocket Pair turns password and keyboard-interactive sign-in off before it opens SSH to your network."
+    : "Pocket Pair cannot prove from the SSH configuration that passwords are off. It turns them off and checks the result with sshd -T."]
+  if (ssh.keys > 0) {
+    notes.push(ssh.keys + (ssh.keys === 1 ? " key is" : " keys are") + " already in ~/.ssh/authorized_keys and keep working.")
+  } else if (ssh.keys === 0) {
+    notes.push("No keys are in ~/.ssh/authorized_keys yet, so nobody can sign in over SSH until your phone pairs."
+      + (checks.sshd ? " Anyone who signs in with a password today will be locked out." : ""))
+  } else {
+    notes.push("~/.ssh/authorized_keys could not be read, so its keys were not counted.")
+  }
+  notes.push("Sessions already open stay connected.")
+  return notes
+}
+
 // The firewall rules for the home network. Every rule says `from <subnet>`;
 // there is deliberately no variant without it.
 function lanRules(subnet) {
@@ -261,6 +391,11 @@ function lanRules(subnet) {
 function firewallFixes(subnet) {
   var rules = lanRules(subnet)
   return [
+    {
+      id: "fw-check",
+      cmd: SSH_VERIFY + " || { echo \"SSH does not accept keys only, so the firewall was not opened.\"; false; }",
+      why: "make sure SSH accepts keys only before opening it"
+    },
     { id: "fw-ssh", cmd: rules.ssh, why: "SSH from your home network only" },
     { id: "fw-mosh", cmd: rules.mosh, why: "Mosh from your home network only" },
     { id: "fw-note", cmd: rules.remember, why: "remember it is open (no root)" }
@@ -281,11 +416,15 @@ function closeFixes(subnets) {
 }
 
 function pendingFixes(checks, mode) {
+  var lan = normalizeMode(mode) === MODE_LAN
   var list = []
   if (!checks.mosh) list.push({ id: "mosh", cmd: FIXES.mosh.cmd, why: FIXES.mosh.why })
+  // Key-only goes in before sshd is started or opened: the drop-in is only a
+  // file, so a server that is off never listens with passwords on.
+  if (lan && !checks.ssh.keyOnly) list = list.concat(keyOnlyFixes())
   if (!checks.sshd) list.push({ id: "sshd", cmd: FIXES.sshd.cmd, why: FIXES.sshd.why })
-  if (normalizeMode(mode) === MODE_LAN) {
-    if (checks.ufw === "active" && checks.lan.ok && !checks.firewallOpen) {
+  if (lan) {
+    if (checks.ssh.keyOnly && checks.ufw === "active" && checks.lan.ok && !checks.firewallOpen) {
       list = list.concat(firewallFixes(checks.lan.subnet))
     }
   } else if (checks.tailscale.ssh === true) {
@@ -327,8 +466,19 @@ function checklist(checks, mode) {
   })
   if (normalizeMode(mode) === MODE_LAN) {
     rows.push({
+      id: "sshauth", label: "SSH sign-in",
+      state: checks.ssh.keyOnly ? "ok" : "todo",
+      detail: checks.ssh.keyOnly ? "keys only"
+        : checks.ssh.policy === "password" ? "passwords on" : "not verified"
+    })
+    rows.push({
+      id: "sshkeys", label: "Authorized keys",
+      state: "ok",
+      detail: checks.ssh.keys > 0 ? checks.ssh.keys + " already" : checks.ssh.keys === 0 ? "none yet" : "not counted"
+    })
+    rows.push({
       id: "firewall", label: "Firewall",
-      state: checks.ufw !== "active" || checks.firewallOpen ? "ok" : checks.lan.ok ? "todo" : "wait",
+      state: checks.ufw !== "active" || checks.firewallOpen ? "ok" : checks.lan.ok && checks.ssh.keyOnly ? "todo" : "wait",
       detail: checks.ufw !== "active" ? "not in use" : checks.firewallOpen ? "open to your network" : "closed"
     })
   } else {
@@ -345,6 +495,13 @@ function checklist(checks, mode) {
 function pairHost(checks, mode) {
   if (normalizeMode(mode) === MODE_LAN) return checks.lan.ok ? checks.lan.ip : ""
   return checks.tailscale.state === "running" ? checks.tailscale.ip : ""
+}
+
+// Whether a pairing session may start. The home network also needs SSH to
+// accept keys only, whatever the next step says.
+function canPair(checks, mode) {
+  if (pairHost(checks, mode) === "") return false
+  return normalizeMode(mode) !== MODE_LAN || checks.ssh.keyOnly
 }
 
 // One primary action at a time. kind: install, fix, wait, pair, done.
@@ -364,23 +521,34 @@ function nextStep(checks, hosts, mode) {
   }
   var fixes = pendingFixes(checks, mode)
   if (fixes.length > 0) {
-    var firewall = fixes.some(function(fix) { return fix.id === "fw-ssh" })
-    return {
+    var ids = fixes.map(function(fix) { return fix.id })
+    var firewallOnly = ids.every(function(id) { return id.indexOf("fw-") === 0 })
+    var keyOnlyOnly = ids.every(function(id) { return id.indexOf("ssh-") === 0 })
+    var step = {
       kind: "fix",
-      label: firewall && fixes.length === 3 ? "Open firewall for your home network"
+      label: firewallOnly ? "Open firewall for your home network"
+        : keyOnlyOnly ? "Make SSH keys-only"
         : fixes.length === 1 ? "Fix in a terminal" : "Set up in a terminal",
       fixes: fixes
     }
+    if (ids.indexOf("ssh-conf") >= 0) {
+      step.notes = keyOnlyNotes(checks)
+      step.hint = step.notes.join(" ")
+    }
+    return step
   }
   if (hosts && hosts.length > 0) return { kind: "done", label: "Pair another phone" }
   return { kind: "pair", label: "Show QR" }
 }
 
 // A one-line script for the floating terminal: it prints every command before
-// running any of them, then stops at the first failure.
-function fixScript(fixes, heading) {
-  var parts = ["echo '" + (heading || "Pocket Pair will run:") + "'"]
-  fixes.forEach(function(fix) { parts.push("echo '  $ " + fix.cmd + "'") })
+// running any of them, then stops at the first failure. `notes` are printed
+// first, for what the user should know before the password prompt.
+function fixScript(fixes, heading, notes) {
+  var say = function(text) { return "echo '" + String(text).replace(/'/g, "'\\''") + "'" }
+  var parts = [say(heading || "Pocket Pair will run:")]
+  ;(notes || []).forEach(function(note) { parts.push(say(note)) })
+  fixes.forEach(function(fix) { parts.push(say("  $ " + fix.cmd)) })
   parts.push("echo")
   parts.push(fixes.map(function(fix) { return fix.cmd }).join(" && "))
   return parts.join("; ")
@@ -455,6 +623,8 @@ if (typeof module !== "undefined") {
   module.exports = {
     GLYPHS: GLYPHS, PAIR_SECONDS: PAIR_SECONDS, FIXES: FIXES, MODES: MODES,
     normalizeMode: normalizeMode, parseLan: parseLan, parseSubnets: parseSubnets, parseUfw: parseUfw,
+    parseSshPolicy: parseSshPolicy, parseKeyCount: parseKeyCount, keyOnlyFixes: keyOnlyFixes,
+    keyOnlyNotes: keyOnlyNotes, canPair: canPair, SSH_DROPIN: SSH_DROPIN, SSH_VERIFY: SSH_VERIFY,
     lanRules: lanRules, firewallFixes: firewallFixes, closeFixes: closeFixes,
     tailscaleFixes: tailscaleFixes, pairHost: pairHost,
     parseVersion: parseVersion, compareVersions: compareVersions,

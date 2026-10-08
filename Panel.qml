@@ -323,7 +323,7 @@ Panel {
             wrapMode: Text.Wrap
             text: "Home network works on the same Wi-Fi only. It opens SSH to your local network only"
               + (root.engine && root.engine.checks.lan.ok ? " (" + root.engine.checks.lan.subnet + ")" : "")
-              + ", never to everyone. For access from anywhere, use Tailscale."
+              + ", never to everyone, and only once SSH accepts keys only (never passwords). For access from anywhere, use Tailscale."
             color: Color.muted
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -348,7 +348,7 @@ Panel {
           width: parent.width
           wrapMode: Text.Wrap
           text: root.engine && root.engine.lanMode
-            ? "Everything is ready. Put your phone on this Wi-Fi, open Moshi, then show the code."
+            ? "Everything is ready: SSH accepts keys only. Put your phone on this Wi-Fi, open Moshi, then show the code."
             : "Everything is ready. Open Moshi on your phone, then show the code."
           color: root.textColor
           font.family: Style.font.family

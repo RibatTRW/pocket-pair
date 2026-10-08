@@ -1,7 +1,7 @@
 # The checks this repository genuinely runs. `no-mistakes ci-workflow` mirrors
 # `commands.lint` and `commands.test` into .github/workflows/ci.yml.
 commands:
-  test: "node --test test/*.test.mjs && bash -n scripts/install-moshi-hook.sh"
+  test: "node --test test/*.test.mjs && bash -n scripts/install-moshi-hook.sh && bash -n scripts/read-sshd-config.sh"
   # qmllint is not always on PATH, and off an Omarchy machine the qs.* imports
   # cannot be resolved; scripts/lint-qml.sh fails only on real syntax errors.
   lint: "bash scripts/lint-qml.sh BarWidget.qml Engine.qml Panel.qml"

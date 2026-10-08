@@ -29,4 +29,4 @@ jobs:
 
       - name: Test
         run: |
-          node --test test/*.test.mjs && bash -n scripts/install-moshi-hook.sh
+          node --test test/*.test.mjs && bash -n scripts/install-moshi-hook.sh && bash -n scripts/read-sshd-config.sh
