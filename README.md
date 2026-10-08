@@ -6,11 +6,34 @@ Moshi's own installer and `moshi-hook host setup` stop on Omarchy: its install h
 
 ![The pairing panel, showing a placeholder QR](preview.png)
 
-*The QR in this picture is a placeholder from a test run, not a real pairing code.*
+*The QR in this picture is a placeholder, not a real pairing code.*
 
 > Pocket Pair is an independent community plugin. It is not made by, affiliated with, or endorsed by Moshi. The name "Moshi" is used only to say what the plugin works with.
 >
 > This plugin was written with the help of an AI coding agent (Claude) and reviewed by its maintainer.
+
+## Screenshots
+
+Every picture and clip below was captured from a throwaway Omarchy shell on a headless output, with a stand-in `moshi-hook`, no network, and made-up values (the phone names, `100.64.0.7` and `omarchy-demo` are fake). The QR in every frame encodes the placeholder text `pocketpair-demo://fake-link-not-a-real-pairing-code`, not a pairing link. No Moshi logo or colours are used; the panel takes its colours from the Omarchy theme.
+
+![A short clip: open the panel, press Show QR, the QR appears with its countdown](media/pair-flow.gif)
+
+[Same clip as MP4](media/pair-flow.mp4) (about 11 seconds).
+
+| Step | |
+| --- | --- |
+| The bar glyph, unpaired (top) and paired (bottom, theme accent) | ![Bar glyph unpaired and paired](media/bar-unpaired-paired.webp) |
+| 1. Checks run and the first missing piece is offered: install the helper | ![Install helper step](media/step-1-install.webp) |
+| 2. One terminal for whatever needs root; it lists the exact commands first | ![Fix in a terminal step](media/step-2-fix.webp) |
+| 3. Everything in place: one click to the QR | ![Ready, Show QR](media/step-3-ready.webp) |
+| 4. The QR with its five-minute countdown | ![QR with countdown](media/step-4-qr.webp) |
+| 5. After pairing: status and the paired phones, each with a revoke button | ![Paired status with device list](media/step-5-paired.webp) |
+
+### Follows your Omarchy theme
+
+![The panel changing between Omarchy themes](media/pair-themes.gif)
+
+[Same clip as MP4](media/pair-themes.mp4). Stills in two other themes: [Tokyo Night](media/theme-tokyo-night.webp) and [Catppuccin Latte](media/theme-catppuccin-latte.webp).
 
 ## How it works
 
