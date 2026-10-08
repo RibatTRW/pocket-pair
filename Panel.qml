@@ -29,6 +29,7 @@ Panel {
   readonly property bool resultView: pairState === "ready" || pairState === "error" || pairState === "expired"
 
   property string confirmRevokeId: ""
+  property bool confirmSwitch: false
 
   onOpenedChanged: {
     if (!engine) return
@@ -401,7 +402,55 @@ Panel {
             cursorShape: Qt.PointingHandCursor
             onClicked: if (root.engine) {
               root.engine.dismissPair()
-              root.engine.setNetwork(root.engine.lanMode ? "tailscale" : "lan")
+              if (root.engine.lanMode && root.engine.canCloseFirewall) root.confirmSwitch = true
+              else root.engine.setNetwork(root.engine.lanMode ? "tailscale" : "lan")
+            }
+          }
+        }
+
+        Column {
+          visible: root.confirmSwitch && !!root.engine && root.engine.canCloseFirewall && root.engine.lanMode
+          width: parent.width
+          spacing: 4
+
+          Text {
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "The firewall is still open to " + (root.engine ? root.engine.checks.openSubnets.join(", ") : "")
+              + ". Close it before switching?"
+            color: Color.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            textFormat: Text.PlainText
+          }
+
+          Repeater {
+            model: [
+              { label: "Close the firewall, then switch", close: true },
+              { label: "Switch and leave it open", close: false }
+            ]
+
+            delegate: Text {
+              required property var modelData
+              width: parent ? parent.width : 0
+              text: modelData.label
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.underline: choiceHover.containsMouse
+              textFormat: Text.PlainText
+
+              MouseArea {
+                id: choiceHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: if (root.engine) {
+                  root.confirmSwitch = false
+                  if (modelData.close) root.engine.closeFirewall()
+                  root.engine.setNetwork("tailscale")
+                }
+              }
             }
           }
         }
@@ -508,7 +557,7 @@ Panel {
         }
 
         Text {
-          visible: root.engine && root.engine.canCloseFirewall && !root.showingQr && root.pairState !== "starting"
+          visible: root.engine && root.engine.canCloseFirewall && !root.confirmSwitch && !root.showingQr && root.pairState !== "starting"
           width: parent.width
           text: "close the firewall again"
           color: Color.muted

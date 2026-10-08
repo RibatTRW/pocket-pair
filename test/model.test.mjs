@@ -1,6 +1,10 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createRequire } from "node:module"
+import { execFileSync } from "node:child_process"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 const M = createRequire(import.meta.url)("../Model.js")
 
@@ -16,7 +20,7 @@ const addrs = (dev, ip, prefixlen) => JSON.stringify([
 const ready = {
   hook_path: "/h/moshi-hook", hook_version: "moshi-hook version 0.4.20", daemon: "active",
   mosh: "yes", sshd: "active", ts_bin: "yes", ts_status: status("Running"), ts_prefs: '{"RunSSH": false}',
-  ufw: "active", lan_routes: ROUTES, lan_addrs: addrs("wlan0", "192.168.1.16", 24), lan_marker: ""
+  ufw: "active", lan_routes: ROUTES, lan_addrs: addrs("wlan0", "192.168.1.16", 24), lan_subnets: ""
 }
 
 test("versions parse and compare", () => {
@@ -184,7 +188,7 @@ test("lan mode waits with a clear message when the address is refused", () => {
 })
 
 test("lan mode skips Tailscale entirely, including Tailscale SSH", () => {
-  const checks = build({ ts_status: "", ts_bin: "", lan_marker: "192.168.1.0/24", ts_prefs: '{"RunSSH": true}' })
+  const checks = build({ ts_status: "", ts_bin: "", lan_subnets: "192.168.1.0/24", ts_prefs: '{"RunSSH": true}' })
   assert.equal(M.nextStep(checks, [], "lan").kind, "pair")
   assert.equal(M.pairHost(checks, "lan"), "192.168.1.16")
   assert.equal(M.pairHost(build({}), "tailscale"), "100.64.0.1")
@@ -198,7 +202,7 @@ test("lan mode: the firewall step has the exact scoped commands", () => {
   assert.deepEqual(step.fixes.map(f => f.cmd), [
     "sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp",
     "sudo ufw allow from 192.168.1.0/24 to any port 60000:61000 proto udp",
-    "mkdir -p ~/.local/state/pocket-pair && echo 192.168.1.0/24 > ~/.local/state/pocket-pair/lan-subnet"
+    "mkdir -p ~/.local/state/pocket-pair && { grep -qxF 192.168.1.0/24 ~/.local/state/pocket-pair/lan-subnets 2>/dev/null || echo 192.168.1.0/24 >> ~/.local/state/pocket-pair/lan-subnets; }"
   ])
 })
 
@@ -212,11 +216,11 @@ test("lan mode: fix steps come before the firewall rules, and only what is missi
 })
 
 test("lan firewall: already opened for this subnet, ufw off, or ufw missing needs no step", () => {
-  assert.equal(M.nextStep(build({ lan_marker: "192.168.1.0/24" }), [], "lan").kind, "pair")
+  assert.equal(M.nextStep(build({ lan_subnets: "192.168.1.0/24" }), [], "lan").kind, "pair")
   assert.equal(M.nextStep(build({ ufw: "inactive" }), [], "lan").kind, "pair")
   assert.equal(M.nextStep(build({ ufw: "missing" }), [], "lan").kind, "pair")
   // A note for a different network does not count.
-  assert.equal(M.nextStep(build({ lan_marker: "10.0.0.0/24" }), [], "lan").kind, "fix")
+  assert.equal(M.nextStep(build({ lan_subnets: "10.0.0.0/24" }), [], "lan").kind, "fix")
 })
 
 test("every ufw command is scoped to a subnet; none opens to everyone or forwards ports", () => {
@@ -224,23 +228,65 @@ test("every ufw command is scoped to a subnet; none opens to everyone or forward
   const all = [rules.ssh, rules.mosh, rules.sshDelete, rules.moshDelete]
   for (const cmd of all) assert.match(cmd, /^sudo ufw (delete )?allow from 192\.168\.1\.0\/24 to any port /)
   const everything = [
-    ...M.firewallFixes("192.168.1.0/24"), ...M.closeFixes("192.168.1.0/24"),
+    ...M.firewallFixes("192.168.1.0/24"), ...M.closeFixes(["192.168.1.0/24"]),
     ...M.tailscaleFixes({ state: "missing" })
   ].map(f => f.cmd).join("\n")
   assert.doesNotMatch(everything, /upnp|forward|iptables|sshd_config|sudoers|ufw (disable|reset)/i)
   assert.doesNotMatch(everything, /ufw allow (22|60000)/)
 })
 
-test("close the firewall again deletes the matching rules and the note", () => {
-  const fixes = M.closeFixes("192.168.1.0/24")
+test("close the firewall again deletes every recorded subnet's rules and forgets each", () => {
+  const fixes = M.closeFixes(["192.168.1.0/24", "192.168.50.0/24"])
   assert.deepEqual(fixes.map(f => f.cmd), [
     "sudo ufw delete allow from 192.168.1.0/24 to any port 22 proto tcp",
     "sudo ufw delete allow from 192.168.1.0/24 to any port 60000:61000 proto udp",
-    "rm -f ~/.local/state/pocket-pair/lan-subnet"
+    'sed -i "\\|^192\\.168\\.1\\.0/24\\$|d" ~/.local/state/pocket-pair/lan-subnets',
+    "sudo ufw delete allow from 192.168.50.0/24 to any port 22 proto tcp",
+    "sudo ufw delete allow from 192.168.50.0/24 to any port 60000:61000 proto udp",
+    'sed -i "\\|^192\\.168\\.50\\.0/24\\$|d" ~/.local/state/pocket-pair/lan-subnets'
   ])
   const script = M.fixScript(fixes, "Pocket Pair will close the firewall again:")
   assert.match(script, /^echo 'Pocket Pair will close the firewall again:'/)
   assert.ok(script.endsWith(fixes.map(f => f.cmd).join(" && ")))
+})
+
+test("the record is a real list: remember appends once, forget removes only that subnet", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pp-"))
+  const run = cmd => execFileSync("bash", ["-c", cmd], { env: { ...process.env, HOME: dir } })
+  const read = () => readFileSync(join(dir, ".local/state/pocket-pair/lan-subnets"), "utf8")
+  try {
+    for (const subnet of ["192.168.1.0/24", "192.168.50.0/24", "192.168.1.0/24"]) run(M.lanRules(subnet).remember)
+    assert.equal(read(), "192.168.1.0/24\n192.168.50.0/24\n")
+    run(M.lanRules("192.168.1.0/24").forget)
+    assert.equal(read(), "192.168.50.0/24\n")
+    run(M.lanRules("192.168.50.0/24").forget)
+    assert.equal(read(), "")
+  } finally { rmSync(dir, { recursive: true }) }
+})
+
+test("open, then switch to Tailscale: the record still offers closing it", () => {
+  const checks = build({ lan_subnets: "192.168.1.0/24" })
+  assert.deepEqual(checks.openSubnets, ["192.168.1.0/24"])
+  assert.equal(M.nextStep(checks, [], "tailscale").kind, "pair")
+  assert.deepEqual(M.closeFixes(checks.openSubnets).map(f => f.id), ["fw-ssh-close", "fw-mosh-close", "fw-note-close"])
+})
+
+test("open, then change network: the old subnet stays recorded and the new one is opened too", () => {
+  const other = { lan_subnets: "192.168.1.0/24", lan_addrs: addrs("wlan0", "192.168.50.7", 24) }
+  const checks = build(other)
+  assert.equal(checks.firewallOpen, false)
+  assert.deepEqual(checks.openSubnets, ["192.168.1.0/24"])
+  const step = M.nextStep(checks, [], "lan")
+  assert.equal(step.kind, "fix")
+  assert.match(step.fixes[0].cmd, /from 192\.168\.50\.0\/24/)
+  assert.match(step.fixes[2].cmd, />> /)
+  assert.deepEqual(build({ ...other, lan_subnets: "192.168.1.0/24,192.168.50.0/24" }).openSubnets,
+    ["192.168.1.0/24", "192.168.50.0/24"])
+})
+
+test("recorded subnets that are not canonical private subnets are dropped", () => {
+  assert.deepEqual(M.parseSubnets("192.168.1.0/24,8.8.8.0/24,192.168.1.5/24,0.0.0.0/0,10.0.0.0/8,10.0.0.0/24;rm,x"), ["192.168.1.0/24", "10.0.0.0/8"])
+  assert.deepEqual(M.parseSubnets(""), [])
 })
 
 test("firewall command text for a firewall step is shown before it runs", () => {

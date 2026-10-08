@@ -70,10 +70,10 @@ For people without Tailscale. The panel runs the same checks (`mosh`, the SSH se
 ```sh
 sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
 sudo ufw allow from 192.168.1.0/24 to any port 60000:61000 proto udp
-mkdir -p ~/.local/state/pocket-pair && echo 192.168.1.0/24 > ~/.local/state/pocket-pair/lan-subnet
+mkdir -p ~/.local/state/pocket-pair && { grep -qxF 192.168.1.0/24 ~/.local/state/pocket-pair/lan-subnets 2>/dev/null || echo 192.168.1.0/24 >> ~/.local/state/pocket-pair/lan-subnets; }
 ```
 
-The last line writes a one-line note (no root) so the panel can tell the rules are in place; reading `ufw status` itself needs root. Then it pairs with `moshi-hook host setup --json --host <your home-network address>`.
+The last line adds the subnet to a list (one per line, no root) in `~/.local/state/pocket-pair/lan-subnets`, so the panel can tell the rules are in place; reading `ufw status` itself needs root. Every subnet you open is appended, so joining another Wi-Fi and opening it too never loses track of the first. Then it pairs with `moshi-hook host setup --json --host <your home-network address>`.
 
 - **Same Wi-Fi only.** The phone must be on this network. There is no port forwarding and no UPnP: Pocket Pair never sets either up and advises against it.
 - **Scoped, never "anywhere".** Every rule says `from <your subnet>`. Pocket Pair writes no rule without it, and does not edit `sshd_config`.
@@ -81,15 +81,15 @@ The last line writes a one-line note (no root) so the panel can tell the rules a
 - **Refused when it is not a home network.** If the address is not private (RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), or no subnet can be worked out, the panel says so and does not offer the firewall step. IPv4 only.
 - If ufw is not installed or not active, no firewall step is shown.
 
-**To close the firewall again**, press **close the firewall again** in the panel (home-network mode, while the rules are open). A terminal prints and runs:
+**To close the firewall again**, press **close the firewall again** in the panel. It shows whenever any subnet is recorded, in either mode and on any network, and closes exactly the recorded subnets. Switching from home network to Tailscale while rules are open asks whether to close them first. A terminal prints and runs, for each recorded subnet:
 
 ```sh
 sudo ufw delete allow from 192.168.1.0/24 to any port 22 proto tcp
 sudo ufw delete allow from 192.168.1.0/24 to any port 60000:61000 proto udp
-rm -f ~/.local/state/pocket-pair/lan-subnet
+sed -i "\|^192\.168\.1\.0/24\$|d" ~/.local/state/pocket-pair/lan-subnets
 ```
 
-or run those three lines yourself with your own subnet. Removing the plugin does not close them.
+A subnet is removed from the list only after both of its deletes succeeded, and the deletes are safe to repeat. You can also run those lines yourself with your own subnet. Removing the plugin does not close them.
 
 ## Requirements
 

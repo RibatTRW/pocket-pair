@@ -63,7 +63,7 @@ QtObject {
   readonly property string hookPath: checks.hook.present ? checks.hook.path : ""
   readonly property var step: Model.nextStep(checks, hosts, network)
   readonly property var checklist: Model.checklist(checks, network)
-  readonly property bool canCloseFirewall: lanMode && checks.ufw === "active" && checks.firewallOpen
+  readonly property bool canCloseFirewall: checks.openSubnets.length > 0
   readonly property bool paired: hosts.length > 0
   readonly property bool busy: installProc.running || updateProc.running || pairState === "starting" || pairState === "waiting"
 
@@ -84,7 +84,7 @@ QtObject {
     'if command -v ufw >/dev/null 2>&1; then echo "ufw=$(systemctl is-active ufw 2>/dev/null)"; else echo ufw=missing; fi',
     'echo "lan_routes=$(ip -j route show default 2>/dev/null | tr -d "\\n")"',
     'echo "lan_addrs=$(ip -j -4 addr show 2>/dev/null | tr -d "\\n")"',
-    'echo "lan_marker=$(head -n1 "$HOME/.local/state/pocket-pair/lan-subnet" 2>/dev/null)"'
+    'echo "lan_subnets=$(paste -sd, "$HOME/.local/state/pocket-pair/lan-subnets" 2>/dev/null)"'
   ].join("\n")
 
   function refresh() {
@@ -190,12 +190,13 @@ QtObject {
   }
 
   // Closes the home-network firewall rules again, in the same kind of visible
-  // terminal. Only the rules this plugin opened for the detected subnet.
+  // terminal. Only the rules this plugin recorded opening, whichever network
+  // or mode the panel is in now.
   function closeFirewall() {
     if (!canCloseFirewall) return
     fixLaunched = true
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
-      Model.fixScript(Model.closeFixes(checks.lan.subnet), "Pocket Pair will close the firewall again:")])
+      Model.fixScript(Model.closeFixes(checks.openSubnets), "Pocket Pair will close the firewall again:")])
   }
 
   // ---------------------------------------------------------------- pairing

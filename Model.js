@@ -15,7 +15,7 @@ var GLYPHS = {
 
 var PAIR_SECONDS = 300
 var CHECK_KEYS = ["hook_path", "hook_version", "daemon", "mosh", "sshd", "ts_bin", "ts_status", "ts_prefs",
-  "ufw", "lan_routes", "lan_addrs", "lan_marker"]
+  "ufw", "lan_routes", "lan_addrs", "lan_subnets"]
 
 // How the phone reaches this machine: over a tailnet (recommended), or over
 // the home network when the phone is on the same Wi-Fi.
@@ -26,9 +26,10 @@ var MODE_LAN = "lan"
 // The ports Moshi needs open on the home network: SSH, and Mosh's UDP range.
 var SSH_PORT = "22"
 var MOSH_PORTS = "60000:61000"
-// Written by the firewall step once its rules went in (no root needed to read
-// it back, unlike `ufw status`), and removed by the matching close step.
-var LAN_MARKER = "~/.local/state/pocket-pair/lan-subnet"
+// One subnet per line, appended by the firewall step once its rules went in
+// and removed by the matching close step. It is the record of what this plugin
+// opened (no root needed to read it back, unlike `ufw status`).
+var LAN_SUBNETS = "~/.local/state/pocket-pair/lan-subnets"
 
 function normalizeMode(value) {
   return String(value || "") === MODE_LAN ? MODE_LAN : MODE_TAILSCALE
@@ -171,6 +172,24 @@ function parseLan(routesText, addrsText) {
   return result
 }
 
+// The recorded subnets arrive comma-joined. Each one ends up inside a shell
+// command, so only a canonical private IPv4 subnet is kept.
+function parseSubnets(text) {
+  var list = []
+  String(text || "").split(",").forEach(function(item) {
+    var match = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(item.trim())
+    if (!match) return
+    var base = ipv4ToInt(match[1])
+    var prefix = parseInt(match[2], 10)
+    if (base < 0 || prefix > 30 || !isPrivateSubnet(base, prefix)) return
+    var size = Math.pow(2, 32 - prefix)
+    if (base % size !== 0) return
+    var subnet = intToIpv4(base) + "/" + prefix
+    if (list.indexOf(subnet) < 0) list.push(subnet)
+  })
+  return list
+}
+
 function parseUfw(text) {
   var state = String(text || "").trim()
   return state === "active" ? "active" : state === "" || state === "missing" ? "missing" : "inactive"
@@ -182,6 +201,7 @@ function buildChecks(raw, latestText) {
   var latest = parseVersion(latestText)
   var present = !!raw.hook_path && version !== ""
   var lan = parseLan(raw.lan_routes, raw.lan_addrs)
+  var openSubnets = parseSubnets(raw.lan_subnets)
   return {
     hook: {
       present: present,
@@ -196,8 +216,9 @@ function buildChecks(raw, latestText) {
     tailscale: parseTailscale(raw.ts_status, raw.ts_prefs, raw.ts_bin),
     lan: lan,
     ufw: parseUfw(raw.ufw),
+    openSubnets: openSubnets,
     // The rules are "open" once the firewall step recorded this subnet.
-    firewallOpen: lan.ok && String(raw.lan_marker || "").trim() === lan.subnet
+    firewallOpen: lan.ok && openSubnets.indexOf(lan.subnet) >= 0
   }
 }
 
@@ -232,8 +253,8 @@ function lanRules(subnet) {
     mosh: "sudo ufw allow from " + subnet + " to any port " + MOSH_PORTS + " proto udp",
     sshDelete: "sudo ufw delete allow from " + subnet + " to any port " + SSH_PORT + " proto tcp",
     moshDelete: "sudo ufw delete allow from " + subnet + " to any port " + MOSH_PORTS + " proto udp",
-    remember: "mkdir -p ~/.local/state/pocket-pair && echo " + subnet + " > " + LAN_MARKER,
-    forget: "rm -f " + LAN_MARKER
+    remember: "mkdir -p ~/.local/state/pocket-pair && { grep -qxF " + subnet + " " + LAN_SUBNETS + " 2>/dev/null || echo " + subnet + " >> " + LAN_SUBNETS + "; }",
+    forget: "sed -i \"\\|^" + subnet.replace(/\./g, "\\.") + "\\$|d\" " + LAN_SUBNETS
   }
 }
 
@@ -246,13 +267,17 @@ function firewallFixes(subnet) {
   ]
 }
 
-function closeFixes(subnet) {
-  var rules = lanRules(subnet)
-  return [
-    { id: "fw-ssh-close", cmd: rules.sshDelete, why: "close SSH again" },
-    { id: "fw-mosh-close", cmd: rules.moshDelete, why: "close Mosh again" },
-    { id: "fw-note-close", cmd: rules.forget, why: "forget the note (no root)" }
-  ]
+// Closes every recorded subnet; each is forgotten only after both of its
+// deletes succeeded.
+function closeFixes(subnets) {
+  var list = []
+  subnets.forEach(function(subnet) {
+    var rules = lanRules(subnet)
+    list.push({ id: "fw-ssh-close", cmd: rules.sshDelete, why: "close SSH again for " + subnet })
+    list.push({ id: "fw-mosh-close", cmd: rules.moshDelete, why: "close Mosh again for " + subnet })
+    list.push({ id: "fw-note-close", cmd: rules.forget, why: "forget " + subnet + " (no root)" })
+  })
+  return list
 }
 
 function pendingFixes(checks, mode) {
@@ -429,7 +454,7 @@ function scrub(text) {
 if (typeof module !== "undefined") {
   module.exports = {
     GLYPHS: GLYPHS, PAIR_SECONDS: PAIR_SECONDS, FIXES: FIXES, MODES: MODES,
-    normalizeMode: normalizeMode, parseLan: parseLan, parseUfw: parseUfw,
+    normalizeMode: normalizeMode, parseLan: parseLan, parseSubnets: parseSubnets, parseUfw: parseUfw,
     lanRules: lanRules, firewallFixes: firewallFixes, closeFixes: closeFixes,
     tailscaleFixes: tailscaleFixes, pairHost: pairHost,
     parseVersion: parseVersion, compareVersions: compareVersions,
