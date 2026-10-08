@@ -65,7 +65,7 @@ Below it, a small **Use my home network instead** link switches to the home-netw
 
 ### Home network mode
 
-For people without Tailscale. The panel runs the same checks (`mosh`, the SSH server) except Tailscale SSH, detects this machine's address and subnet from the default route's interface (`ip -j route`, `ip -j -4 addr`), and, if ufw is active, adds one step: **Open firewall for your home network**. It opens one terminal that prints the commands first, with your detected subnet (192.168.1.0/24 here is only an example):
+For people without Tailscale. The panel runs the same checks (`mosh`, the SSH server) except Tailscale SSH, detects this machine's address and subnet from the default route's interface (`ip -j route`, `ip -j -4 addr`), checks that SSH accepts keys only (next section), and, if ufw is active, adds one step: **Open firewall for your home network**. It opens one terminal that prints the commands first, with your detected subnet (192.168.1.0/24 here is only an example):
 
 ```sh
 sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
@@ -76,10 +76,30 @@ mkdir -p ~/.local/state/pocket-pair && { grep -qxF 192.168.1.0/24 ~/.local/state
 The last line adds the subnet to a list (one per line, no root) in `~/.local/state/pocket-pair/lan-subnets`, so the panel can tell the rules are in place; reading `ufw status` itself needs root. Every subnet you open is appended, so joining another Wi-Fi and opening it too never loses track of the first. Then it pairs with `moshi-hook host setup --json --host <your home-network address>`.
 
 - **Same Wi-Fi only.** The phone must be on this network. There is no port forwarding and no UPnP: Pocket Pair never sets either up and advises against it.
-- **Scoped, never "anywhere".** Every rule says `from <your subnet>`. Pocket Pair writes no rule without it, and does not edit `sshd_config`.
-- **Still key-only.** SSH on the network only accepts the key the phone pairs with.
+- **Scoped, never "anywhere".** Every rule says `from <your subnet>`. Pocket Pair writes no rule without it, and never edits `sshd_config` itself (its one SSH change is the drop-in file described below).
+- **Keys only, never passwords.** Once the check below passes, SSH on the network accepts keys only: the phone's key plus any keys already in `~/.ssh/authorized_keys`. Until it passes, the firewall step and the QR stay locked.
 - **Refused when it is not a home network.** If the address is not private (RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), or no subnet can be worked out, the panel says so and does not offer the firewall step. IPv4 only.
 - If ufw is not installed or not active, no firewall step is shown.
+
+#### SSH must be keys only first
+
+Opening SSH to your network while passwords still work would let anyone on it try to guess one, so the home-network mode will not open the firewall, and will not show the QR, until SSH is verified to accept keys only. Omarchy's own hardening (`/etc/ssh/sshd_config.d/10-omarchy-hardening.conf`) is not always there: the SSH server may have been switched on before it existed, and Omarchy's migration deliberately leaves passwords on when it finds no usable key. So "sshd is running" is not enough.
+
+- **What is checked.** Password and keyboard-interactive login must both be off, key login must not be off, and `AuthenticationMethods` must not require a password method. The panel reads the readable SSH config (`/etc/ssh/sshd_config` with its `Include` lines expanded, by [`scripts/read-sshd-config.sh`](scripts/read-sshd-config.sh)) with sshd's own rule that the first value wins. **Anything it cannot prove is treated as not key-only**: an unreadable or too deeply nested include, an unusual value. A `Match` block that touches sign-in is not evaluated by `sshd -T`, so the panel and the terminal check both stop and ask you to review it yourself; Pocket Pair never edits it.
+- **Asked of sshd itself, as root.** The terminal steps run `sudo sshd -T`, which prints the effective configuration, and require the same four lines. The firewall step runs that check as its first command, so the rules are never added if it fails, even if the panel was out of date.
+- **If SSH is not key-only**, the panel offers **Make SSH keys-only**. One terminal prints these commands, then asks for your password (`sudo`). It runs them in order and stops at the first failure:
+
+```sh
+printf "%s\n" "# Written by Pocket Pair: SSH accepts keys only. Delete this file and run sudo systemctl reload sshd to allow passwords again." "PasswordAuthentication no" "KbdInteractiveAuthentication no" | sudo install -Dm644 /dev/stdin /etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf
+sudo sshd -t || { sudo rm -f /etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf; echo "..."; false; }
+[ "$(sudo sshd -T | grep -ixcE "(passwordauthentication|kbdinteractiveauthentication) no|pubkeyauthentication yes|authenticationmethods (any|publickey)")" = 4 ] || { sudo rm -f /etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf; echo "..."; false; }
+{ ! systemctl is-active --quiet sshd || sudo systemctl reload sshd; }
+```
+
+  The file is written first, sshd validates it (`sshd -t`), `sshd -T` confirms the result, and only then is a running sshd reloaded (new connections only; sessions already open stay connected). If sshd rejects its configuration, or an earlier rule such as one in a lower-numbered drop-in still allows passwords, Pocket Pair removes its own file again, says so, and goes no further. `sshd_config` itself and sudoers are never edited, and no `ufw limit` or any rule without `from <subnet>` is used. When sshd is off, the file is written before `sudo systemctl enable --now sshd` starts it, so the server never listens with passwords on because of this plugin.
+- **To undo it:** `sudo rm /etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf && sudo systemctl reload sshd`. Passwords work again unless another rule turns them off. Omarchy's own file is a separate one and is never touched. Closing the firewall again does not undo this file.
+- **Who can sign in.** With keys only on, SSH accepts the key your phone pairs with **and every key already in `~/.ssh/authorized_keys`**. Pocket Pair adds only the phone's key and revokes only that key; it never adds, edits or removes the others. The panel shows how many keys are already there (a count, never the keys). That file is the usual place sshd looks; keys supplied some other way (`AuthorizedKeysFile` elsewhere, `AuthorizedKeysCommand`) are not counted.
+- **No keys found.** That is safe: with keys only on and an empty or missing `authorized_keys` (and no keys supplied another way), nobody can sign in over SSH until pairing adds the phone's key. The steps are ordered so there is never a moment where SSH is reachable from your network with passwords on because of Pocket Pair. The one consequence worth knowing: if you or someone else signs in to this machine over SSH with a password today, that stops working. The panel and the terminal both say so (and how many keys already exist) before the password prompt, and a refusal at the prompt changes nothing.
 
 **To close the firewall again**, press **close the firewall again** in the panel. It shows whenever any subnet is recorded, in either mode and on any network, and closes exactly the recorded subnets. Switching from home network to Tailscale while rules are open asks whether to close them first. A terminal prints and runs, for each recorded subnet:
 
@@ -134,9 +154,10 @@ The panel never runs `sudo` itself. When one of these is needed it opens Omarchy
 | --- | --- |
 | `sudo pacman -S mosh` | `moshi-hook host setup` requires `mosh-server`. |
 | `sudo systemctl enable --now sshd` | Omarchy ships OpenSSH but leaves it off, so the phone would have nothing to connect to. The Arch unit is `sshd` (Debian calls it `ssh`). |
+| Home network mode only: the key-only drop-in and `sshd -t` / `sshd -T` / reload commands under [SSH must be keys only first](#ssh-must-be-keys-only-first) | SSH on your network must accept keys only before the firewall is opened or the QR is shown. |
 | `sudo tailscale set --ssh=false` | Tailscale mode only. While Tailscale SSH is on, Tailscale answers port 22 on your tailnet itself, so the key Moshi adds to `~/.ssh/authorized_keys` would never be used. |
 
-Pocket Pair does not edit `sshd_config` or sudoers. In Tailscale mode it does not change the firewall: Omarchy's firewall (ufw) denies incoming connections by default and that is left alone, and this plugin does not verify that Tailscale traffic gets through ahead of it. In home-network mode the only firewall change is the two scoped rules above. If your phone still cannot connect after pairing, check your firewall rules for port 22.
+Pocket Pair never edits `sshd_config` or sudoers. In home-network mode only, it adds the one `sshd_config.d` drop-in described under [SSH must be keys only first](#ssh-must-be-keys-only-first), and nothing else about the SSH server's configuration. In Tailscale mode it does not change the firewall: Omarchy's firewall (ufw) denies incoming connections by default and that is left alone, and this plugin does not verify that Tailscale traffic gets through ahead of it. In home-network mode the only firewall change is the two scoped rules above, and only after SSH is verified keys only. If your phone still cannot connect after pairing, check your firewall rules for port 22.
 
 ### Pairing and the QR
 

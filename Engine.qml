@@ -11,7 +11,7 @@ import "Model.js" as Model
 // that would otherwise keep a link alive.
 //
 // Root never runs from here. The fixes that need it (including the home-network
-// firewall rules and closing them again) are handed to Omarchy's floating terminal, which shows the commands and asks for the
+// key-only SSH drop-in, the firewall rules and closing them again) are handed to Omarchy's floating terminal, which shows the commands and asks for the
 // password itself; this file only notices, by polling, when they worked.
 //
 // The pairing link is an access token. It is read from one line of stdout,
@@ -84,12 +84,27 @@ QtObject {
     'if command -v ufw >/dev/null 2>&1; then echo "ufw=$(systemctl is-active ufw 2>/dev/null)"; else echo ufw=missing; fi',
     'echo "lan_routes=$(ip -j route show default 2>/dev/null | tr -d "\\n")"',
     'echo "lan_addrs=$(ip -j -4 addr show 2>/dev/null | tr -d "\\n")"',
-    'echo "lan_subnets=$(paste -sd, "$HOME/.local/state/pocket-pair/lan-subnets" 2>/dev/null)"'
+    'echo "lan_subnets=$(paste -sd, "$HOME/.local/state/pocket-pair/lan-subnets" 2>/dev/null)"',
+    // What SSH accepts: the readable config (passive state only; the terminal
+    // steps ask sshd itself) and how many keys are already authorized. Only
+    // the count leaves this script, never a key.
+    'echo "ssh_conf=$(bash "$2/scripts/read-sshd-config.sh" 2>/dev/null | tr "\\n" "\\037")"',
+    'ak="$HOME/.ssh/authorized_keys"',
+    'if [ ! -e "$ak" ]; then echo auth_keys=0',
+    'elif [ ! -r "$ak" ] || ! command -v ssh-keygen >/dev/null 2>&1; then echo auth_keys=unknown',
+    'else',
+    '  n=0',
+    '  while IFS= read -r l || [ -n "$l" ]; do',
+    '    [[ $l =~ ^[[:space:]]*(#|$) ]] && continue',
+    '    ssh-keygen -lf /dev/stdin <<<"$l" >/dev/null 2>&1 && n=$((n + 1))',
+    '  done <"$ak"',
+    '  echo "auth_keys=$n"',
+    'fi'
   ].join("\n")
 
   function refresh() {
     if (!checkProc.running) {
-      checkProc.command = ["bash", "-c", engine.checkScript, "pocket-pair", engine.hookOverride]
+      checkProc.command = ["bash", "-c", engine.checkScript, "pocket-pair", engine.hookOverride, engine.pluginDir]
       checkProc.running = true
     }
     // The latest release only changes when Moshi ships, so ask at most hourly.
@@ -112,6 +127,14 @@ QtObject {
         engine.rawChecks = Model.parseCheckOutput(text)
         engine.checked = true
         if (engine.step.kind !== "fix") engine.fixLaunched = false
+        // A pairing session on the home network ends if SSH stops being
+        // key-only underneath it.
+        if (engine.lanMode && !Model.canPair(engine.checks, engine.network)
+            && (engine.pairState === "starting" || engine.pairState === "waiting")) {
+          engine.cancelPair()
+          engine.pairState = "error"
+          engine.pairError = "SSH no longer accepts keys only, so pairing was stopped."
+        }
         engine.refreshHosts()
       }
     }
@@ -186,7 +209,8 @@ QtObject {
     var fixes = engine.step.fixes
     if (!fixes || fixes.length === 0) return
     engine.fixLaunched = true
-    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", Model.fixScript(fixes)])
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
+      Model.fixScript(fixes, undefined, engine.step.notes)])
   }
 
   // Closes the home-network firewall rules again, in the same kind of visible
@@ -210,7 +234,8 @@ QtObject {
 
   function startPair() {
     var address = Model.pairHost(checks, network)
-    if (pairProc.running || !hookPath || address === "") return
+    // On the home network nothing pairs until SSH accepts keys only.
+    if (pairProc.running || !hookPath || address === "" || !Model.canPair(checks, network)) return
     pairError = ""
     qrRows = []
     qrSize = 0
