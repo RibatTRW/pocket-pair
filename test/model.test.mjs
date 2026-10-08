@@ -593,7 +593,10 @@ test("firewall check passes only for a key-only sshd -T", () => {
   const bin = join(dir, "bin")
   try {
     mkdirSync(bin)
-    writeFileSync(join(bin, "sudo"), '#!/bin/bash\nexec "$@"\n', { mode: 0o755 })
+    // Stand-in sudo: /etc paths map under the throwaway directory (the real host files are skipped).
+    mkdirSync(join(dir, "etc/ssh/sshd_config.d"), { recursive: true })
+    writeFileSync(join(dir, "etc/ssh/sshd_config"), "Port 22\n")
+    writeFileSync(join(bin, "sudo"), `#!/bin/bash\nshopt -s nullglob\nargs=(); for a in "$@"; do case "$a" in /etc/*) for m in ${dir}$a; do [ -e "$m" ] && args+=("$m"); done;; *) args+=("$a");; esac; done\nexec "\${args[@]}"\n`, { mode: 0o755 })
     writeFileSync(join(bin, "sshd"), FAKE_BIN_SSHD_T, { mode: 0o755 })
     const run = effective => {
       writeFileSync(join(dir, "eff"), effective)
