@@ -202,11 +202,14 @@ function parseSubnets(text) {
 //
 // Returns "keyonly" only when it can be proven from that text; "password" when
 // password or keyboard-interactive login is provably on; "unknown" for
-// everything else (an unreadable file, an AuthenticationMethods that is not
-// plain publickey, an odd value); "match" when a Match block touches sign-in,
-// which sshd -T does not evaluate, so only the user can review it. The gate
-// treats all but "keyonly" the same: stop. The authoritative answer is
-// `sshd -T`, which the terminal steps run as root.
+// everything else (an unreadable file, an Include that points somewhere this
+// user cannot look, an AuthenticationMethods that is not plain publickey, an
+// odd value); "match" when a Match block touches sign-in, which sshd -T does
+// not evaluate, so only the user can review it. Only "password" is a state
+// Pocket Pair offers to fix. "unknown" and "match" stop it before it starts or
+// reloads SSH, because a file it cannot read could hold a Match block that
+// allows passwords. The authoritative answer is `sshd -T` plus a scan of every
+// included file as root, which the terminal steps run.
 //
 // sshd keeps the first value it reads for these keywords, defaults to
 // passwords on, and treats ChallengeResponseAuthentication as another name for
@@ -219,29 +222,78 @@ var SSH_AUTH_KEYWORDS = {
   pubkeyauthentication: "pubkey"
 }
 
-function parseSshPolicy(text) {
+// What the user should look at: file paths and Match lines from the reader,
+// cut to printable ASCII and a short length before they reach the panel.
+function reviewNote(text) {
+  return String(text).replace(/[^\x20-\x7e]/g, "?").replace(/\s+/g, " ").trim().slice(0, 120)
+}
+
+// policy plus `review`, a short list of the files or Match blocks that need a
+// manual look (empty when there is nothing specific to point at).
+function analyzeSshConfig(text) {
   var lines = String(text || "").split(/[\u001f\r\n]/)
   var first = {}
-  var inMatch = false
+  var review = []
+  var blocks = []
+  var block = null
   var touchedInMatch = false
   var unresolved = lines.every(function(l) { return l.trim() === "" })
+  var addReview = function(note) {
+    var clean = reviewNote(note)
+    if (clean !== "" && review.indexOf(clean) < 0 && review.length < 5) review.push(clean)
+  }
+  var flag = function(note) { unresolved = true; addReview(note) }
+  if (unresolved) flag("No SSH configuration could be read.")
   lines.forEach(function(raw) {
     var line = raw.trim()
     if (line === "" || line.charAt(0) === "#") return
     var parsed = /^([A-Za-z0-9]+)(?:\s*=\s*|\s+)(.*)$/.exec(line)
-    if (!parsed) { unresolved = true; return }
+    if (!parsed) { flag("A line in the SSH configuration was not understood."); return }
     var keyword = parsed[1].toLowerCase()
+    if (keyword === "pocketpairat") {
+      if (block) block.at = parsed[2].trim()
+      return
+    }
+    if (keyword === "pocketpairunresolved") {
+      var detail = /^(\S+)\s*(.*)$/.exec(parsed[2].trim()) || ["", "", ""]
+      var where = detail[2] !== "" ? detail[2] : "a file that sshd reads"
+      flag(detail[1] === "unreadable" ? where + " cannot be read without root."
+        : detail[1] === "hidden" ? "An Include points at " + where + ", which this user cannot look inside."
+        : detail[1] === "depth" ? "Includes nest too deeply in " + where + "."
+        : detail[1] === "quoting" ? where + " has a quoted Include."
+        : "Part of the SSH configuration could not be read.")
+      return
+    }
     var words = parsed[2].split(/\s+/)
     var cut = words.findIndex(function(w) { return w.charAt(0) === "#" })
     if (cut >= 0) words = words.slice(0, cut)
     var value = words.join(" ").replace(/^"(.*)"$/, "$1").toLowerCase()
-    if (keyword === "match") { inMatch = true; return }
-    if (keyword === "include" || keyword === "pocketpairunresolved") { unresolved = true; return }
+    if (keyword === "match") {
+      block = { line: line, at: "", touches: false }
+      blocks.push(block)
+      return
+    }
+    if (keyword === "include") { flag("An Include line was not expanded."); return }
     var slot = SSH_AUTH_KEYWORDS[keyword]
     if (!slot) return
-    if (inMatch) { touchedInMatch = true; return }
+    if (block) {
+      block.touches = true
+      touchedInMatch = true
+      return
+    }
     if (first[slot] === undefined) first[slot] = value
   })
+  blocks.forEach(function(b) {
+    if (b.touches) addReview(b.line + (b.at !== "" ? " (in " + b.at + ")" : "") + " changes how sign-in works.")
+  })
+  var policy = verdict(first, unresolved, touchedInMatch)
+  if (policy !== "keyonly" && policy !== "password" && review.length === 0) {
+    review.push("The sign-in settings could not be proven to allow keys only.")
+  }
+  return { policy: policy, review: review }
+}
+
+function verdict(first, unresolved, touchedInMatch) {
   if (unresolved) return "unknown"
   if (touchedInMatch) return "match"
   var password = first.password === undefined ? "yes" : first.password
@@ -252,6 +304,10 @@ function parseSshPolicy(text) {
   var methods = first.methods === undefined ? "any" : first.methods
   if (methods === "any" || methods === "publickey") return "keyonly"
   return /password|keyboard-interactive/.test(methods) ? "password" : "unknown"
+}
+
+function parseSshPolicy(text) {
+  return analyzeSshConfig(text).policy
 }
 
 // auth_keys is a count, or "unknown" when ~/.ssh/authorized_keys exists but
@@ -273,7 +329,8 @@ function buildChecks(raw, latestText) {
   var present = !!raw.hook_path && version !== ""
   var lan = parseLan(raw.lan_routes, raw.lan_addrs)
   var openSubnets = parseSubnets(raw.lan_subnets)
-  var policy = parseSshPolicy(raw.ssh_conf)
+  var sshConf = analyzeSshConfig(raw.ssh_conf)
+  var policy = sshConf.policy
   return {
     hook: {
       present: present,
@@ -285,7 +342,7 @@ function buildChecks(raw, latestText) {
     daemon: raw.daemon === "active",
     mosh: raw.mosh === "yes",
     sshd: raw.sshd === "active",
-    ssh: { policy: policy, keyOnly: policy === "keyonly", keys: parseKeyCount(raw.auth_keys) },
+    ssh: { policy: policy, keyOnly: policy === "keyonly", keys: parseKeyCount(raw.auth_keys), review: sshConf.review },
     tailscale: parseTailscale(raw.ts_status, raw.ts_prefs, raw.ts_bin),
     lan: lan,
     ufw: parseUfw(raw.ufw),
@@ -320,11 +377,35 @@ function tailscaleFixes(tailscale) {
 
 // "Key-only" as sshd itself reports it: `sshd -T` prints the effective
 // configuration (needs root, so it runs in the terminal step). All four lines
-// must be there; a missing or different line fails the check. Match blocks are
-// not evaluated by -T, so a Match block that touches sign-in fails it too.
-var SSH_MATCH = "[ \"$(sudo awk 'tolower($0) ~ /^[ \\t]*match[ \\t=]/ { m = 1 }"
-  + " m && tolower($0) ~ /^[ \\t]*(passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|authenticationmethods|pubkeyauthentication)[ \\t=]/ { f = 1 }"
-  + " END { print f + 0 }' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf)\" = 0 ]"
+// must be there; a missing or different line fails the check.
+//
+// `sshd -T` without -C reports the global values only, and a Match block
+// overrides them for the connections it matches. So the check also reads every
+// file sshd reads, as root: sshd_config and each Include, recursively and in
+// place (an Include inside a Match block stays inside it), and fails on
+// anything it cannot verify: a Match block with a sign-in keyword in it
+// (PasswordAuthentication, KbdInteractiveAuthentication,
+// ChallengeResponseAuthentication, AuthenticationMethods, PubkeyAuthentication),
+// a quoted Include, Includes nested past sshd's limit of 16, or a file it cannot
+// read. It prints the file or line to review. Nothing is edited. The path of the
+// SSH directory is its first argument so the tests can point it elsewhere.
+var SSH_MATCH = "sudo bash -c 'shopt -s nocasematch nullglob; r=$1; bad=0; m=0; q=$(printf \"\\47\");"
+  + " no() { bad=1; echo \"Needs a manual look: $1\"; };"
+  + " scan() { local l w f rest; local -a ws;"
+  + " [ \"$2\" -ge 16 ] && { no \"$1 (Includes nested too deeply)\"; return; };"
+  + " [ -r \"$1\" ] || { no \"$1 (cannot be read)\"; return; };"
+  + " while IFS= read -r l || [ -n \"$l\" ]; do"
+  + " if [[ $l =~ ^[[:space:]]*include([[:space:]]+|[[:space:]]*=[[:space:]]*)(.*)$ ]]; then"
+  + " rest=${BASH_REMATCH[2]};"
+  + " case $rest in *\\\"*|*\"$q\"*) no \"$1 (quoted Include: ${l:0:80})\"; continue;; esac;"
+  + " read -ra ws <<<\"$rest\";"
+  + " for w in \"${ws[@]}\"; do [[ $w == \\#* ]] && break; case $w in /*) f=$w;; *) f=$r/$w;; esac;"
+  + " for f in $f; do [ -f \"$f\" ] && scan \"$f\" $(($2 + 1)); done; done;"
+  + " elif [[ $l =~ ^[[:space:]]*match([[:space:]=]|$) ]]; then m=1;"
+  + " elif [ $m = 1 ] && [[ $l =~ ^[[:space:]]*(passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|authenticationmethods|pubkeyauthentication)([[:space:]=]|$) ]];"
+  + " then no \"$1 (sign-in rule inside a Match block: ${l:0:80})\"; fi;"
+  + " done <\"$1\"; };"
+  + " scan \"$r/sshd_config\" 0; [ $bad = 0 ]' pocket-pair /etc/ssh"
 var SSH_VERIFY = "[ \"$(sudo sshd -T | grep -ixcE \"(passwordauthentication|kbdinteractiveauthentication) no"
   + "|pubkeyauthentication yes|authenticationmethods (any|publickey)\")\" = 4 ] && " + SSH_MATCH
 
@@ -350,7 +431,8 @@ function keyOnlyFixes() {
     {
       id: "ssh-verify",
       cmd: SSH_VERIFY + " || { " + remove + "; echo \"sshd is not keys only after all: an earlier rule overrides the"
-        + " Pocket Pair file, AuthenticationMethods allows more, or a Match block touches sign-in. The file was removed. Review that yourself, or use Tailscale.\"; false; }",
+        + " Pocket Pair file, AuthenticationMethods allows more, an included file could not be read, or a Match block touches sign-in."
+        + " The file was removed and SSH was not started or reloaded. Review that yourself, or use Tailscale.\"; false; }",
       why: "confirm sshd really is keys only now"
     },
     {
@@ -361,13 +443,23 @@ function keyOnlyFixes() {
   ]
 }
 
+// For SSH that already reads as keys only: the same root check, run before a
+// stopped sshd is started, so the panel's reading is never the last word.
+function sshCheckFix() {
+  return {
+    id: "ssh-check",
+    cmd: SSH_VERIFY + " || { echo \"SSH could not be verified as keys only (a file it could not read, or a Match block"
+      + " that touches sign-in), so it was not started.\"; false; }",
+    why: "make sure SSH accepts keys only before starting it"
+  }
+}
+
 // Words for the panel and for the terminal, shown before anything runs. Counts
 // only: the keys themselves are never read into the panel.
 function keyOnlyNotes(checks) {
   var ssh = checks.ssh
-  var notes = [ssh.policy === "password"
-    ? "SSH on this machine still accepts passwords. Pocket Pair turns password and keyboard-interactive sign-in off before it opens SSH to your network."
-    : "Pocket Pair cannot prove from the SSH configuration that passwords are off. It turns them off and checks the result with sshd -T."]
+  var notes = ["SSH on this machine still accepts passwords. Pocket Pair turns password and keyboard-interactive sign-in off before it opens SSH to your network."
+    + " It then reads every file sshd includes, as root, and stops without starting or reloading SSH if a Match block or a file it cannot read could still allow passwords."]
   if (ssh.keys > 0) {
     notes.push(ssh.keys + (ssh.keys === 1 ? " key is" : " keys are") + " already in ~/.ssh/authorized_keys and keep working.")
   } else if (ssh.keys === 0) {
@@ -399,7 +491,7 @@ function firewallFixes(subnet) {
   return [
     {
       id: "fw-check",
-      cmd: SSH_VERIFY + " || { echo \"SSH does not accept keys only (or a Match block touches sign-in), so the firewall was not opened.\"; false; }",
+      cmd: SSH_VERIFY + " || { echo \"SSH does not accept keys only (or a file could not be read, or a Match block touches sign-in), so the firewall was not opened.\"; false; }",
       why: "make sure SSH accepts keys only before opening it"
     },
     { id: "fw-ssh", cmd: rules.ssh, why: "SSH from your home network only" },
@@ -426,9 +518,15 @@ function pendingFixes(checks, mode) {
   var list = []
   if (!checks.mosh) list.push({ id: "mosh", cmd: FIXES.mosh.cmd, why: FIXES.mosh.why })
   // Key-only goes in before sshd is started or opened: the drop-in is only a
-  // file, so a server that is off never listens with passwords on.
-  if (lan && !checks.ssh.keyOnly && checks.ssh.policy !== "match") list = list.concat(keyOnlyFixes())
-  if (!checks.sshd) list.push({ id: "sshd", cmd: FIXES.sshd.cmd, why: FIXES.sshd.why })
+  // file, so a server that is off never listens with passwords on. Only a
+  // provable "passwords on" is fixed this way. When the configuration cannot be
+  // read in full, or a Match block touches sign-in, SSH is neither started nor
+  // reloaded: it could be a Match block, in a file only root can read, that
+  // allows passwords, and the drop-in cannot override that.
+  var unverified = lan && (checks.ssh.policy === "match" || checks.ssh.policy === "unknown")
+  if (lan && checks.ssh.policy === "password") list = list.concat(keyOnlyFixes())
+  else if (lan && checks.ssh.keyOnly && !checks.sshd) list.push(sshCheckFix())
+  if (!checks.sshd && !unverified) list.push({ id: "sshd", cmd: FIXES.sshd.cmd, why: FIXES.sshd.why })
   if (lan) {
     if (checks.ssh.keyOnly && checks.ufw === "active" && checks.lan.ok && !checks.firewallOpen) {
       list = list.concat(firewallFixes(checks.lan.subnet))
@@ -473,10 +571,10 @@ function checklist(checks, mode) {
   if (normalizeMode(mode) === MODE_LAN) {
     rows.push({
       id: "sshauth", label: "SSH sign-in",
-      state: checks.ssh.keyOnly ? "ok" : checks.ssh.policy === "match" ? "wait" : "todo",
+      state: checks.ssh.keyOnly ? "ok" : checks.ssh.policy === "password" ? "todo" : "wait",
       detail: checks.ssh.keyOnly ? "keys only"
         : checks.ssh.policy === "password" ? "passwords on"
-        : checks.ssh.policy === "match" ? "Match block: review by hand" : "not verified"
+        : checks.ssh.policy === "match" ? "Match block: review by hand" : "not verified: review by hand"
     })
     rows.push({
       id: "sshkeys", label: "Authorized keys",
@@ -526,11 +624,17 @@ function nextStep(checks, hosts, mode) {
       alt: { mode: MODE_LAN, label: "Use my home network instead" }
     }
   }
-  if (mode === MODE_LAN && checks.ssh.policy === "match") {
+  if (mode === MODE_LAN && (checks.ssh.policy === "match" || checks.ssh.policy === "unknown")) {
+    var look = checks.ssh.review.length > 0 ? " Needs a look: " + checks.ssh.review.join(" ") : ""
     return {
       kind: "wait", label: "Check again",
-      hint: "A Match block in your SSH configuration touches sign-in (passwords, keys or AuthenticationMethods), which Pocket Pair cannot verify."
-        + " Review it yourself so it allows keys only, or use Tailscale. Pocket Pair never edits it."
+      hint: checks.ssh.policy === "match"
+        ? "A Match block in your SSH configuration touches sign-in (passwords, keys or AuthenticationMethods), which Pocket Pair cannot verify."
+          + " It will not start or reload SSH." + look
+          + " Review it yourself so it allows keys only, or use Tailscale. Pocket Pair never edits it."
+        : "Pocket Pair cannot read or verify all of your SSH sign-in configuration, and a file it cannot read could allow passwords."
+          + " It will not start or reload SSH." + look
+          + " Review it yourself so it can be read and allows keys only, or use Tailscale. Pocket Pair never edits it."
     }
   }
   var fixes = pendingFixes(checks, mode)
@@ -637,7 +741,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     GLYPHS: GLYPHS, PAIR_SECONDS: PAIR_SECONDS, FIXES: FIXES, MODES: MODES,
     normalizeMode: normalizeMode, parseLan: parseLan, parseSubnets: parseSubnets, parseUfw: parseUfw,
-    parseSshPolicy: parseSshPolicy, parseKeyCount: parseKeyCount, keyOnlyFixes: keyOnlyFixes,
+    parseSshPolicy: parseSshPolicy, analyzeSshConfig: analyzeSshConfig, sshCheckFix: sshCheckFix, parseKeyCount: parseKeyCount, keyOnlyFixes: keyOnlyFixes,
     keyOnlyNotes: keyOnlyNotes, canPair: canPair, SSH_DROPIN: SSH_DROPIN, SSH_VERIFY: SSH_VERIFY, SSH_MATCH: SSH_MATCH,
     lanRules: lanRules, firewallFixes: firewallFixes, closeFixes: closeFixes,
     tailscaleFixes: tailscaleFixes, pairHost: pairHost,

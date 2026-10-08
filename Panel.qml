@@ -323,7 +323,7 @@ Panel {
             wrapMode: Text.Wrap
             text: "Home network works on the same Wi-Fi only. It opens SSH to your local network only"
               + (root.engine && root.engine.checks.lan.ok ? " (" + root.engine.checks.lan.subnet + ")" : "")
-              + ", never to everyone, and only once SSH accepts keys only (never passwords). For access from anywhere, use Tailscale."
+              + ", never to everyone, and only once SSH is verified to accept keys only (never passwords). If Pocket Pair cannot read or verify all of your SSH configuration, it stops and does not start or reload SSH. For access from anywhere, use Tailscale."
             color: Color.muted
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
