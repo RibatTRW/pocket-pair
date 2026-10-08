@@ -10,8 +10,8 @@ import "Model.js" as Model
 // the panel is closed, and so closing the panel can cancel a pairing session
 // that would otherwise keep a link alive.
 //
-// Root never runs from here. The three fixes that need it are handed to
-// Omarchy's floating terminal, which shows the commands and asks for the
+// Root never runs from here. The fixes that need it (including the home-network
+// firewall rules and closing them again) are handed to Omarchy's floating terminal, which shows the commands and asks for the
 // password itself; this file only notices, by polling, when they worked.
 //
 // The pairing link is an access token. It is read from one line of stdout,
@@ -39,9 +39,31 @@ QtObject {
   property double latestAt: 0
   property bool fixLaunched: false
 
+  // How the phone reaches this machine: "tailscale" (recommended) or "lan".
+  // Kept in the widget's own settings so it survives a restart.
+  readonly property string network: Model.normalizeMode(host && host.settings ? host.settings.network : "")
+  readonly property bool lanMode: network === "lan"
+
+  function setNetwork(mode) {
+    mode = Model.normalizeMode(mode)
+    if (mode === network) return
+    dismissPair()
+    fixLaunched = false
+    var entry = { id: host.moduleName }
+    for (var key in host.settings) if (key !== "id") entry[key] = host.settings[key]
+    entry.network = mode
+    // Applied locally first so the panel changes on the click itself; the
+    // shell.json write comes back through the bar as the same value.
+    host.settings = entry
+    if (host.bar && host.bar.shell && typeof host.bar.shell.updateEntryInline === "function")
+      host.bar.shell.updateEntryInline(host.moduleName, entry)
+    refresh()
+  }
+
   readonly property string hookPath: checks.hook.present ? checks.hook.path : ""
-  readonly property var step: Model.nextStep(checks, hosts)
-  readonly property var checklist: Model.checklist(checks)
+  readonly property var step: Model.nextStep(checks, hosts, network)
+  readonly property var checklist: Model.checklist(checks, network)
+  readonly property bool canCloseFirewall: lanMode && checks.ufw === "active" && checks.firewallOpen
   readonly property bool paired: hosts.length > 0
   readonly property bool busy: installProc.running || updateProc.running || pairState === "starting" || pairState === "waiting"
 
@@ -55,9 +77,14 @@ QtObject {
     'if command -v mosh-server >/dev/null 2>&1; then echo mosh=yes; else echo mosh=no; fi',
     'echo "sshd=$(systemctl is-active sshd 2>/dev/null)"',
     'if command -v tailscale >/dev/null 2>&1; then',
+    '  echo ts_bin=yes',
     '  echo "ts_status=$(timeout 5 tailscale status --json --peers=false 2>/dev/null | tr -d "\\n")"',
     '  echo "ts_prefs=$(timeout 5 tailscale debug prefs 2>/dev/null | tr -d "\\n")"',
-    'fi'
+    'fi',
+    'if command -v ufw >/dev/null 2>&1; then echo "ufw=$(systemctl is-active ufw 2>/dev/null)"; else echo ufw=missing; fi',
+    'echo "lan_routes=$(ip -j route show default 2>/dev/null | tr -d "\\n")"',
+    'echo "lan_addrs=$(ip -j -4 addr show 2>/dev/null | tr -d "\\n")"',
+    'echo "lan_marker=$(head -n1 "$HOME/.local/state/pocket-pair/lan-subnet" 2>/dev/null)"'
   ].join("\n")
 
   function refresh() {
@@ -162,6 +189,15 @@ QtObject {
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", Model.fixScript(fixes)])
   }
 
+  // Closes the home-network firewall rules again, in the same kind of visible
+  // terminal. Only the rules this plugin opened for the detected subnet.
+  function closeFirewall() {
+    if (!canCloseFirewall) return
+    fixLaunched = true
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation",
+      Model.fixScript(Model.closeFixes(checks.lan.subnet), "Pocket Pair will close the firewall again:")])
+  }
+
   // ---------------------------------------------------------------- pairing
   // idle, starting, waiting (QR on screen), ready, expired, error
   property string pairState: "idle"
@@ -172,13 +208,14 @@ QtObject {
   property bool pairExpectedStop: false
 
   function startPair() {
-    if (pairProc.running || !hookPath || checks.tailscale.ip === "") return
+    var address = Model.pairHost(checks, network)
+    if (pairProc.running || !hookPath || address === "") return
     pairError = ""
     qrRows = []
     qrSize = 0
     pairState = "starting"
     pairExpectedStop = false
-    pairProc.command = [hookPath, "host", "setup", "--json", "--host", checks.tailscale.ip]
+    pairProc.command = [hookPath, "host", "setup", "--json", "--host", address]
     pairProc.running = true
   }
 
