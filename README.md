@@ -23,7 +23,7 @@ Every picture and clip below was captured from a throwaway Omarchy shell on a he
 | Step | |
 | --- | --- |
 | The bar glyph, unpaired (top) and paired (bottom, theme accent) | ![Bar glyph unpaired and paired](media/bar-unpaired-paired.webp) |
-| 1. Checks run and the first missing piece is offered: install the helper | ![Install helper step](media/step-1-install.webp) |
+| 1. Checks run and the first missing piece is offered: install the helper | ![Install helper step](media/step-1-helper.webp) |
 | 2. One terminal for whatever needs root; it lists the exact commands first | ![Fix in a terminal step](media/step-2-fix.webp) |
 | 3. Everything in place: one click to the QR | ![Ready, Show QR](media/step-3-ready.webp) |
 | 4. The QR with its five-minute countdown | ![QR with countdown](media/step-4-qr.webp) |
