@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "ribattrw.pocket-pair",
+  "name": "Pocket Pair",
+  "version": "1.0.0",
+  "author": "RibatTRW",
+  "license": "MIT",
+  "description": "Sign in to the Moshi phone terminal from Omarchy: one panel checks the machine, fixes what is missing, and shows the pairing QR.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Pocket Pair",
+    "description": "Set up and pair this computer with the Moshi phone app over Tailscale",
+    "category": "Developer Tools",
+    "aliases": ["moshi", "pair", "phone", "ssh", "mosh", "tailscale"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "hookBinary": ""
+    },
+    "schema": [
+      {
+        "key": "hookBinary",
+        "type": "string",
+        "label": "moshi-hook path (blank = find it automatically)",
+        "defaultValue": ""
+      }
+    ]
+  }
+}
