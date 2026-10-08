@@ -401,6 +401,15 @@ test("gate: a Match block touching sign-in is not re-offered the same step; it a
   assert.equal(M.nextStep(checks, [], "tailscale").kind, "pair")
 })
 
+test("gate: stock defaults plus a Match block touching sign-in also ask for a manual review", () => {
+  const checks = build({ ssh_conf: conf("Port 22", "Match User bob", "PasswordAuthentication yes") })
+  assert.equal(checks.ssh.policy, "match")
+  const step = M.nextStep(checks, [], "lan")
+  assert.equal(step.kind, "wait")
+  assert.equal(step.fixes, undefined)
+  assert.equal(M.canPair(checks, "lan"), false)
+})
+
 test("gate: verified key-only opens the firewall step, then the QR", () => {
   const checks = build({})
   assert.equal(checks.ssh.keyOnly, true)

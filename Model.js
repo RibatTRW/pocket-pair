@@ -243,11 +243,11 @@ function parseSshPolicy(text) {
     if (first[slot] === undefined) first[slot] = value
   })
   if (unresolved) return "unknown"
+  if (touchedInMatch) return "match"
   var password = first.password === undefined ? "yes" : first.password
   var kbd = first.kbd === undefined ? "yes" : first.kbd
   if (password === "yes" || kbd === "yes") return "password"
   if (password !== "no" || kbd !== "no") return "unknown"
-  if (touchedInMatch) return "match"
   if (first.pubkey !== undefined && first.pubkey !== "yes") return "unknown"
   var methods = first.methods === undefined ? "any" : first.methods
   if (methods === "any" || methods === "publickey") return "keyonly"
