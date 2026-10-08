@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ribattrw.pocket-pair",
   "name": "Pocket Pair",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "RibatTRW",
   "license": "MIT",
   "description": "Sign in to the Moshi phone terminal from Omarchy: one panel checks the machine, fixes what is missing, and shows the pairing QR.",

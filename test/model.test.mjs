@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createRequire } from "node:module"
 import { execFileSync } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -27,7 +27,8 @@ const ready = {
 // The exact effective-policy check, written out so a change to it shows up here.
 const VERIFY = '[ "$(sudo sshd -T | grep -ixcE "(passwordauthentication|kbdinteractiveauthentication) no'
   + '|pubkeyauthentication yes|authenticationmethods (any|publickey)")" = 4 ] && ' + M.SSH_MATCH
-const VERIFY_FW = VERIFY + ' || { echo "SSH does not accept keys only (or a Match block touches sign-in), so the firewall was not opened."; false; }'
+const VERIFY_FW = VERIFY + ' || { echo "SSH does not accept keys only (or a file could not be read, or a Match block touches sign-in), so the firewall was not opened."; false; }'
+const VERIFY_START = VERIFY + ' || { echo "SSH could not be verified as keys only (a file it could not read, or a Match block that touches sign-in), so it was not started."; false; }'
 const DROPIN = "/etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf"
 
 test("versions parse and compare", () => {
@@ -217,8 +218,7 @@ test("lan mode: the firewall step has the exact scoped commands", () => {
 test("lan mode: fix steps come before the firewall rules, and only what is missing", () => {
   const step = M.nextStep(build({ mosh: "no", sshd: "inactive" }), [], "lan")
   assert.deepEqual(step.fixes.map(f => f.cmd).slice(0, 4), [
-    "sudo pacman -S mosh", "sudo systemctl enable --now sshd", VERIFY_FW,
-    "sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp"
+    "sudo pacman -S mosh", VERIFY_START, "sudo systemctl enable --now sshd", VERIFY_FW
   ])
   assert.equal(step.label, "Set up in a terminal")
 })
@@ -311,6 +311,8 @@ test("tailscale mode never asks for firewall changes", () => {
 
 const conf = (...lines) => lines.join("\u001f")
 const KEYONLY = conf("PasswordAuthentication no", "KbdInteractiveAuthentication no")
+// Readable and complete, and provably passwords on (sshd's defaults).
+const PASSWORDS = conf("Port 22", "UsePAM yes")
 
 test("ssh policy: key-only is proven only by both password methods off", () => {
   assert.equal(M.parseSshPolicy(KEYONLY), "keyonly")
@@ -368,12 +370,13 @@ test("check output carries the ssh keys", () => {
   const raw = M.parseCheckOutput("ssh_conf=" + KEYONLY + "\nauth_keys=2\nssh_secret=x")
   assert.deepEqual(Object.keys(raw), ["ssh_conf", "auth_keys"])
   const checks = M.buildChecks({ ...ready, ...raw }, "")
-  assert.deepEqual(checks.ssh, { policy: "keyonly", keyOnly: true, keys: 2 })
+  assert.deepEqual(checks.ssh, { policy: "keyonly", keyOnly: true, keys: 2, review: [] })
 })
 
-test("gate: password or unknown policy locks the firewall and the QR behind the key-only step", () => {
-  for (const ssh_conf of [conf("KbdInteractiveAuthentication no"), ""]) {
+test("gate: provable passwords locks the firewall and the QR behind the key-only step", () => {
+  for (const ssh_conf of [conf("KbdInteractiveAuthentication no"), conf("Port 22", "PasswordAuthentication yes"), conf("UsePAM yes")]) {
     const checks = build({ ssh_conf })
+    assert.equal(checks.ssh.policy, "password")
     const step = M.nextStep(checks, [], "lan")
     assert.equal(step.kind, "fix")
     assert.equal(step.label, "Make SSH keys-only")
@@ -410,6 +413,68 @@ test("gate: stock defaults plus a Match block touching sign-in also ask for a ma
   assert.equal(M.canPair(checks, "lan"), false)
 })
 
+test("gate: an unresolved configuration never schedules key-only setup or starting SSH", () => {
+  const unresolved = {
+    "nothing came back": "",
+    "an unreadable Include": conf(KEYONLY, "PocketPairUnresolved unreadable /etc/ssh/extra/pp.conf"),
+    "an unreadable Include, passwords on otherwise": conf(PASSWORDS, "PocketPairUnresolved unreadable /etc/ssh/extra/pp.conf"),
+    "an Include into a directory this user cannot list": conf(KEYONLY, "PocketPairUnresolved hidden /etc/ssh/private/*.conf"),
+    "a quoted Include": conf(KEYONLY, "PocketPairUnresolved quoting /etc/ssh/sshd_config"),
+    "Includes nested too deeply": conf(KEYONLY, "PocketPairUnresolved depth /etc/ssh/sshd_config"),
+    "an Include left as it was": conf(KEYONLY, "Include /etc/ssh/more.conf"),
+    "an odd value": conf("PasswordAuthentication maybe", "KbdInteractiveAuthentication no")
+  }
+  for (const [what, ssh_conf] of Object.entries(unresolved)) {
+    for (const sshd of ["inactive", "active"]) {
+      const checks = build({ ssh_conf, sshd, mosh: "no" })
+      assert.equal(checks.ssh.policy, "unknown", what)
+      const step = M.nextStep(checks, [], "lan")
+      assert.equal(step.kind, "wait", what)
+      assert.equal(step.fixes, undefined, what)
+      assert.match(step.hint, /will not start or reload SSH/, what)
+      assert.equal(M.canPair(checks, "lan"), false, what)
+      // Even asked directly, nothing starts, reloads or rewrites SSH; the unrelated mosh install may stay.
+      const ids = M.pendingFixes(checks, "lan").map(f => f.id)
+      assert.deepEqual(ids, ["mosh"], what)
+      const row = M.checklist(checks, "lan").find(r => r.id === "sshauth")
+      assert.deepEqual([row.state, row.detail], ["wait", "not verified: review by hand"], what)
+      assert.equal(M.checklist(checks, "lan").find(r => r.id === "firewall").state, "wait", what)
+    }
+  }
+  // Tailscale mode is untouched by all of this.
+  assert.equal(M.nextStep(build({ ssh_conf: "" }), [], "tailscale").kind, "pair")
+})
+
+test("gate: the panel names the file or Match block to review", () => {
+  const hidden = build({ ssh_conf: conf(KEYONLY, "PocketPairUnresolved unreadable /etc/ssh/extra/pp.conf") })
+  assert.deepEqual(hidden.ssh.review, ["/etc/ssh/extra/pp.conf cannot be read without root."])
+  assert.match(M.nextStep(hidden, [], "lan").hint, /Needs a look: \/etc\/ssh\/extra\/pp\.conf cannot be read without root\./)
+  assert.match(M.nextStep(hidden, [], "lan").hint, /never edits it/)
+  const dir = build({ ssh_conf: conf(KEYONLY, "PocketPairUnresolved hidden /etc/ssh/private/*.conf") })
+  assert.match(dir.ssh.review[0], /\/etc\/ssh\/private\/\*\.conf, which this user cannot look inside/)
+  const match = build({ ssh_conf: conf(KEYONLY, "Match Address 192.168.0.0/16", "PocketPairAt /etc/ssh/extra/pp.conf", "PasswordAuthentication yes") })
+  assert.equal(match.ssh.policy, "match")
+  assert.deepEqual(match.ssh.review, ["Match Address 192.168.0.0/16 (in /etc/ssh/extra/pp.conf) changes how sign-in works."])
+  assert.match(M.nextStep(match, [], "lan").hint, /Needs a look: Match Address 192\.168\.0\.0\/16 \(in \/etc\/ssh\/extra\/pp\.conf\)/)
+  assert.match(M.nextStep(match, [], "lan").hint, /will not start or reload SSH/)
+  // A Match block that does not touch sign-in is not mentioned; control characters never reach the panel.
+  assert.deepEqual(build({ ssh_conf: conf(KEYONLY, "Match User git", "AllowTcpForwarding no") }).ssh.review, [])
+  const odd = M.analyzeSshConfig(conf(KEYONLY, "PocketPairUnresolved unreadable /etc/ssh/a\u001b[2Jb.conf"))
+  assert.doesNotMatch(odd.review.join(""), /[^\x20-\x7e]/)
+  assert.ok(M.analyzeSshConfig(conf(KEYONLY, "PocketPairUnresolved unreadable /" + "x".repeat(500))).review[0].length <= 120)
+})
+
+test("gate: key-only already proven still gets the root check before a stopped sshd is started", () => {
+  const stopped = M.pendingFixes(build({ sshd: "inactive", ufw: "inactive" }), "lan")
+  assert.deepEqual(stopped.map(f => f.id), ["ssh-check", "sshd"])
+  assert.equal(stopped[0].cmd, VERIFY_START)
+  assert.equal(M.nextStep(build({ sshd: "inactive", ufw: "inactive" }), [], "lan").label, "Set up in a terminal")
+  // Nothing to start, nothing to check.
+  assert.deepEqual(M.pendingFixes(build({ ufw: "inactive" }), "lan").map(f => f.id), [])
+  // Tailscale mode never adds it.
+  assert.ok(!M.pendingFixes(build({ sshd: "inactive" }), "tailscale").some(f => f.id === "ssh-check"))
+})
+
 test("gate: verified key-only opens the firewall step, then the QR", () => {
   const checks = build({})
   assert.equal(checks.ssh.keyOnly, true)
@@ -434,7 +499,7 @@ test("gate: Tailscale mode is untouched", () => {
 })
 
 test("key-only step: exact commands, in order, and before sshd is started", () => {
-  const checks = build({ ssh_conf: "", sshd: "inactive", mosh: "no" })
+  const checks = build({ ssh_conf: PASSWORDS, sshd: "inactive", mosh: "no" })
   const step = M.nextStep(checks, [], "lan")
   assert.equal(step.label, "Set up in a terminal")
   assert.deepEqual(step.fixes.map(f => f.cmd), [
@@ -443,11 +508,12 @@ test("key-only step: exact commands, in order, and before sshd is started", () =
       + ' "PasswordAuthentication no" "KbdInteractiveAuthentication no" | sudo install -Dm644 /dev/stdin ' + DROPIN,
     "sudo sshd -t || { sudo rm -f " + DROPIN + '; echo "sshd rejected its configuration. Pocket Pair removed its file and changed nothing else."; false; }',
     VERIFY + " || { sudo rm -f " + DROPIN + '; echo "sshd is not keys only after all: an earlier rule overrides the Pocket Pair file,'
-      + ' AuthenticationMethods allows more, or a Match block touches sign-in. The file was removed. Review that yourself, or use Tailscale."; false; }',
+      + ' AuthenticationMethods allows more, an included file could not be read, or a Match block touches sign-in.'
+      + ' The file was removed and SSH was not started or reloaded. Review that yourself, or use Tailscale."; false; }',
     "{ ! systemctl is-active --quiet sshd || sudo systemctl reload sshd; }",
     "sudo systemctl enable --now sshd"
   ])
-  const only = M.nextStep(build({ ssh_conf: "" }), [], "lan")
+  const only = M.nextStep(build({ ssh_conf: PASSWORDS }), [], "lan")
   assert.equal(only.fixes.length, 4)
   assert.ok(only.fixes.findIndex(f => f.id === "ssh-test") < only.fixes.findIndex(f => f.id === "ssh-reload"), "validate before reload")
 })
@@ -468,15 +534,15 @@ test("the firewall step checks sshd -T first, so stale panel state cannot open i
 })
 
 test("missing authorized keys: the step says nobody can sign in until the phone pairs; counts never show keys", () => {
-  const none = M.nextStep(build({ ssh_conf: "", auth_keys: "0" }), [], "lan")
+  const none = M.nextStep(build({ ssh_conf: PASSWORDS, auth_keys: "0" }), [], "lan")
   assert.match(none.hint, /No keys were found in ~\/\.ssh\/authorized_keys\. Unless keys come from elsewhere \(AuthorizedKeysFile, AuthorizedKeysCommand\), nobody can sign in over SSH until your phone pairs\./)
   assert.match(none.hint, /Anyone who signs in with a password today will stop being able to\./)
   assert.match(none.hint, /Sessions already open stay connected\./)
-  assert.match(M.nextStep(build({ ssh_conf: "", auth_keys: "1" }), [], "lan").hint, /1 key is already in ~\/\.ssh\/authorized_keys and keep working\./)
-  assert.match(M.nextStep(build({ ssh_conf: "", auth_keys: "4" }), [], "lan").hint, /4 keys are already in/)
-  assert.match(M.nextStep(build({ ssh_conf: "", auth_keys: "unknown" }), [], "lan").hint, /could not be read/)
+  assert.match(M.nextStep(build({ ssh_conf: PASSWORDS, auth_keys: "1" }), [], "lan").hint, /1 key is already in ~\/\.ssh\/authorized_keys and keep working\./)
+  assert.match(M.nextStep(build({ ssh_conf: PASSWORDS, auth_keys: "4" }), [], "lan").hint, /4 keys are already in/)
+  assert.match(M.nextStep(build({ ssh_conf: PASSWORDS, auth_keys: "unknown" }), [], "lan").hint, /could not be read/)
   // sshd is off, so no one signs in with a password today.
-  assert.doesNotMatch(M.nextStep(build({ ssh_conf: "", auth_keys: "0", sshd: "inactive" }), [], "lan").hint, /stop being able to/)
+  assert.doesNotMatch(M.nextStep(build({ ssh_conf: PASSWORDS, auth_keys: "0", sshd: "inactive" }), [], "lan").hint, /stop being able to/)
   const rows = key => M.checklist(build({ auth_keys: key }), "lan").find(r => r.id === "sshkeys").detail
   assert.deepEqual([rows("0"), rows("3"), rows("unknown")], ["none yet", "3 already", "not counted"])
 })
@@ -502,9 +568,11 @@ case "$1" in
 esac
 `
 
-// Runs the exact key-only commands with a stand-in sudo (no privilege, paths
-// mapped under a throwaway directory), sshd and systemctl.
-function runKeyOnlyFix({ effective, testRc = 0, active = true, preexisting = false, sshdConfig = "" }) {
+// Runs the exact key-only commands (or any chain of fixes) with a stand-in sudo
+// (no privilege, paths mapped under a throwaway directory), sshd, systemctl and
+// ufw. `files` are extra files under the fake /etc/ssh, `calls` is what
+// systemctl and ufw were asked to do. HOME is the throwaway directory too.
+function runKeyOnlyFix({ effective, testRc = 0, active = true, preexisting = false, sshdConfig = "", files = {}, fixes = M.keyOnlyFixes() }) {
   const dir = mkdtempSync(join(tmpdir(), "pp-fix-"))
   const bin = join(dir, "bin")
   const write = (name, body) => { writeFileSync(join(bin, name), body, { mode: 0o755 }) }
@@ -513,17 +581,22 @@ function runKeyOnlyFix({ effective, testRc = 0, active = true, preexisting = fal
     mkdirSync(join(dir, "etc/ssh/sshd_config.d"), { recursive: true })
     writeFileSync(join(dir, "effective"), effective)
     writeFileSync(join(dir, "etc/ssh/sshd_config"), sshdConfig)
+    for (const [name, body] of Object.entries(files)) {
+      mkdirSync(join(dir, "etc/ssh", name, ".."), { recursive: true })
+      writeFileSync(join(dir, "etc/ssh", name), body)
+    }
     if (preexisting) writeFileSync(join(dir, "etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf"), "old\n")
     write("sudo", `#!/bin/bash\nshopt -s nullglob\nargs=(); for a in "$@"; do case "$a" in /etc/*) for m in ${dir}$a; do [ -e "$m" ] || [ "\${args[0]:-}" != awk ] && args+=("$m"); done;; *) args+=("$a");; esac; done\n`
-      + `case "\${args[0]}" in install|rm|sshd|systemctl|awk) exec "\${args[@]}";; *) echo "unexpected sudo $*" >&2; exit 99;; esac\n`)
+      + `case "\${args[0]}" in install|rm|sshd|systemctl|ufw|bash) exec "\${args[@]}";; *) echo "unexpected sudo $*" >&2; exit 99;; esac\n`)
     write("sshd", FAKE_BIN_SSHD_T)
+    write("ufw", `#!/bin/bash\necho "ufw $*" >> "${dir}/calls"\n`)
     write("systemctl", `#!/bin/bash\necho "systemctl $*" >> "${dir}/calls"\n`
       + `[ "$1" = is-active ] && exit ${active ? 0 : 3}\nexit 0\n`)
-    const script = M.fixScript(M.keyOnlyFixes())
+    const script = M.fixScript(fixes)
     let rc = 0, out = ""
     try {
       out = execFileSync("bash", ["-c", script], {
-        env: { ...process.env, PATH: bin + ":" + process.env.PATH, FAKE_SSHD_T_OUT: join(dir, "effective"), FAKE_SSHD_T_RC: String(testRc) },
+        env: { ...process.env, HOME: dir, PATH: bin + ":" + process.env.PATH, FAKE_SSHD_T_OUT: join(dir, "effective"), FAKE_SSHD_T_RC: String(testRc) },
         stdio: ["ignore", "pipe", "pipe"]
       }).toString()
     } catch (e) { rc = e.status; out = e.stdout.toString() + e.stderr.toString() }
@@ -586,6 +659,87 @@ test("key-only fix: sshd -t failing removes the file and stops before verify and
   assert.equal(r.exists, false)
   assert.equal(r.calls, "")
   assert.match(r.out, /sshd rejected its configuration/)
+})
+
+// The maintainer's case: the panel (a user, not root) cannot read an Include
+// outside sshd_config.d, so its reading may be stale or wrong. The fix chain
+// below is what it would still schedule from a stale "passwords on" reading;
+// the terminal, as root, must stop before sshd is started or reloaded.
+const STALE_PASSWORDS = build({ ssh_conf: PASSWORDS, sshd: "inactive", ufw: "active" })
+const STALE_KEYONLY = build({ sshd: "inactive", ufw: "active" })
+const PP_MATCH = "# only root can read this\nMatch Address 192.168.0.0/16\n  PasswordAuthentication yes\n"
+const MAIN_WITH_EXTRA = "Include sshd_config.d/*.conf\nInclude extra/*.conf\nPort 22\n"
+
+test("terminal: an Include outside sshd_config.d with a Match password exception stops SSH from starting or reloading", () => {
+  for (const [name, fixes] of [["key-only setup", M.pendingFixes(STALE_PASSWORDS, "lan")],
+      ["start only", M.pendingFixes(STALE_KEYONLY, "lan")], ["firewall only", M.firewallFixes("192.168.1.0/24")]]) {
+    for (const active of [false, true]) {
+      const r = runKeyOnlyFix({ effective: KEYONLY_T, active, fixes, sshdConfig: MAIN_WITH_EXTRA, files: { "extra/pp.conf": PP_MATCH, "sshd_config.d/10-pocket-pair-keyonly.conf": "PasswordAuthentication no\nKbdInteractiveAuthentication no\n" } })
+      assert.notEqual(r.rc, 0, name)
+      assert.match(r.out, /Needs a manual look: \S+\/etc\/ssh\/extra\/pp\.conf \(sign-in rule inside a Match block:\s+PasswordAuthentication yes\)/, name)
+      assert.equal(r.calls, "", name + ": sshd was neither started nor reloaded, no firewall rule was added")
+      assert.doesNotMatch(r.out, /unexpected sudo/, name)
+    }
+  }
+  // Only Pocket Pair's own file is removed again; the other file stays as it was.
+  const r = runKeyOnlyFix({ effective: KEYONLY_T, sshdConfig: MAIN_WITH_EXTRA, files: { "extra/pp.conf": PP_MATCH } })
+  assert.equal(r.exists, false)
+  assert.match(r.out, /SSH was not started or reloaded/)
+})
+
+test("terminal: a nested Include, however deep, is followed and a Match password exception is caught", () => {
+  const nested = {
+    "sshd_config.d/20-x.conf": "Include nested/a.conf\n",
+    "nested/a.conf": "# fine so far\nInclude nested/b.conf\n",
+    "nested/b.conf": "Port 22\nMATCH   address 192.168.0.0/16\n\tpasswordauthentication=yes\n"
+  }
+  const r = runKeyOnlyFix({ effective: KEYONLY_T, active: false, sshdConfig: "Include sshd_config.d/*.conf\n", files: nested })
+  assert.notEqual(r.rc, 0)
+  assert.match(r.out, /Needs a manual look: \S+\/nested\/b\.conf \(sign-in rule inside a Match block/)
+  assert.equal(r.calls, "")
+  // An Include inside a Match block keeps what it brings in inside that block.
+  const conditional = runKeyOnlyFix({ effective: KEYONLY_T, sshdConfig: "Match User bob\n  Include extra/x.conf\n",
+    files: { "extra/x.conf": "AuthenticationMethods password\n" } })
+  assert.notEqual(conditional.rc, 0)
+  assert.match(conditional.out, /extra\/x\.conf \(sign-in rule inside a Match block/)
+  assert.equal(conditional.calls, "")
+})
+
+test("terminal: includes that cannot be followed fail closed instead of passing", () => {
+  const chain = {}
+  for (let i = 0; i < 18; i++) chain[`deep/${i}.conf`] = `Include deep/${i + 1}.conf\n`
+  const cases = {
+    "nested past sshd's limit": [{ "sshd_config": "Include deep/0.conf\n", ...chain }, /Includes nested too deeply/],
+    "a quoted Include": [{ "sshd_config": 'Include "extra/pp.conf"\n' }, /quoted Include/]
+  }
+  for (const [what, [files, message]] of Object.entries(cases)) {
+    const { sshd_config, ...rest } = files
+    const r = runKeyOnlyFix({ effective: KEYONLY_T, sshdConfig: sshd_config, files: rest })
+    assert.notEqual(r.rc, 0, what)
+    assert.match(r.out, message, what)
+    assert.equal(r.calls, "", what)
+  }
+})
+
+test("terminal: a clean tree, nested includes and harmless Match blocks still pass, reload, and start a stopped sshd", () => {
+  const files = {
+    "sshd_config.d/10-omarchy.conf": "PasswordAuthentication no\nKbdInteractiveAuthentication no\n",
+    "extra/a.conf": "Include extra/b.conf # nested\n",
+    "extra/b.conf": "Match User git\n  AllowTcpForwarding no\n  ForceCommand git-shell\n",
+    "extra/notes.txt": "Match all\nPasswordAuthentication yes\n"
+  }
+  const sshdConfig = "Include sshd_config.d/*.conf\nInclude extra/a.conf /nonexistent/*.conf\nPort 22\n"
+  const reload = runKeyOnlyFix({ effective: KEYONLY_T, sshdConfig, files })
+  assert.equal(reload.rc, 0, reload.out)
+  assert.equal(reload.calls, "systemctl is-active --quiet sshd\nsystemctl reload sshd\n")
+  // A stopped sshd whose panel reading was already key-only: checked as root, then started.
+  const start = runKeyOnlyFix({ effective: KEYONLY_T, sshdConfig, files, fixes: M.pendingFixes(build({ sshd: "inactive", ufw: "inactive" }), "lan") })
+  assert.equal(start.rc, 0, start.out)
+  assert.equal(start.calls, "systemctl enable --now sshd\n")
+  // With ufw active the whole first-run chain goes through, in order.
+  const full = runKeyOnlyFix({ effective: KEYONLY_T, sshdConfig, files, fixes: M.pendingFixes(build({ sshd: "inactive" }), "lan") })
+  assert.equal(full.rc, 0, full.out)
+  assert.equal(full.calls, "systemctl enable --now sshd\nufw allow from 192.168.1.0/24 to any port 22 proto tcp\nufw allow from 192.168.1.0/24 to any port 60000:61000 proto udp\n")
 })
 
 test("firewall check passes only for a key-only sshd -T", () => {
@@ -668,9 +822,73 @@ test("sshd config reader leaves an unreadable include unresolved", { skip: proce
     writeFileSync(join(dir, "a.conf"), "x\n", { mode: 0o000 })
     const out = execFileSync("bash", [join(import.meta.dirname, "../scripts/read-sshd-config.sh")],
       { env: { ...process.env, POCKET_PAIR_SSH_DIR: dir } }).toString()
-    assert.match(out, /^PocketPairUnresolved unreadable$/m)
+    assert.match(out, /^PocketPairUnresolved unreadable \S+\/a\.conf$/m)
     assert.equal(M.parseSshPolicy(out.split("\n").join("\u001f")), "unknown")
   } finally { rmSync(dir, { recursive: true }) }
+})
+
+// Reads a throwaway tree as this user, after `prepare(dir)` changed its modes.
+function readTree(files, modes = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "pp-ssh-"))
+  try {
+    for (const [name, body] of Object.entries(files)) {
+      mkdirSync(join(dir, name, ".."), { recursive: true })
+      writeFileSync(join(dir, name), body)
+    }
+    for (const [name, mode] of Object.entries(modes)) chmodSync(join(dir, name), mode)
+    return execFileSync("bash", [join(import.meta.dirname, "../scripts/read-sshd-config.sh")],
+      { env: { ...process.env, POCKET_PAIR_SSH_DIR: dir } }).toString().trim().split("\n").join("\u001f").replaceAll(dir, "<root>")
+  } finally {
+    for (const name of Object.keys(modes)) try { chmodSync(join(dir, name), 0o755) } catch (e) { /* already gone */ }
+    rmSync(dir, { recursive: true })
+  }
+}
+
+const NOT_ROOT = { skip: process.getuid && process.getuid() === 0 }
+const EXTRA_MAIN = "Include sshd_config.d/*.conf\nInclude extra/*.conf\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+
+test("sshd config reader: a Match block in an Include outside sshd_config.d is named, with its file", () => {
+  const text = readTree({ "sshd_config": EXTRA_MAIN, "extra/pp.conf": PP_MATCH })
+  assert.match(text, /Match Address 192\.168\.0\.0\/16\u001fPocketPairAt <root>\/extra\/pp\.conf\u001f {2}PasswordAuthentication yes/)
+  const checks = build({ ssh_conf: text })
+  assert.equal(checks.ssh.policy, "match")
+  assert.deepEqual(checks.ssh.review, ["Match Address 192.168.0.0/16 (in <root>/extra/pp.conf) changes how sign-in works."])
+  assert.equal(M.nextStep(checks, [], "lan").kind, "wait")
+})
+
+test("sshd config reader: an unreadable Include outside sshd_config.d holding a Match password exception stops the flow", NOT_ROOT, () => {
+  const text = readTree({ "sshd_config": EXTRA_MAIN, "sshd_config.d/10-x.conf": "Port 22\n", "extra/pp.conf": PP_MATCH }, { "extra/pp.conf": 0o000 })
+  assert.match(text, /PocketPairUnresolved unreadable <root>\/extra\/pp\.conf/)
+  for (const sshd of ["inactive", "active"]) {
+    const checks = build({ ssh_conf: text, sshd, ufw: "inactive" })
+    assert.equal(checks.ssh.policy, "unknown")
+    const step = M.nextStep(checks, [], "lan")
+    assert.equal(step.kind, "wait")
+    assert.match(step.hint, /<root>\/extra\/pp\.conf cannot be read without root/)
+    assert.deepEqual(M.pendingFixes(checks, "lan"), [])
+  }
+})
+
+test("sshd config reader: an Include into a directory this user cannot list is unresolved, not empty", NOT_ROOT, () => {
+  const tree = { "sshd_config": EXTRA_MAIN, "extra/pp.conf": PP_MATCH }
+  const text = readTree(tree, { "extra": 0o000 })
+  assert.match(text, /PocketPairUnresolved hidden <root>\/extra\/\*\.conf/)
+  assert.equal(build({ ssh_conf: text }).ssh.policy, "unknown")
+  const noList = readTree(tree, { "extra": 0o311 })
+  assert.match(noList, /PocketPairUnresolved hidden/)
+  assert.equal(build({ ssh_conf: noList }).ssh.policy, "unknown")
+  // A directory the pattern names that is behind an unsearchable parent is hidden too.
+  const parent = readTree({ "sshd_config": "Include deep/extra/*.conf\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n", "deep/extra/pp.conf": PP_MATCH }, { "deep": 0o000 })
+  assert.match(parent, /PocketPairUnresolved hidden <root>\/deep\/extra\/\*\.conf/)
+})
+
+test("sshd config reader: an Include whose directory is simply absent or empty stays resolved", () => {
+  const main = "Include sshd_config.d/*.conf\nInclude extra/*.conf missing/one.conf\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+  for (const files of [{ "sshd_config": main }, { "sshd_config": main, "sshd_config.d/notes.txt": "x\n", "extra/.keep": "" }]) {
+    const text = readTree(files)
+    assert.equal(text, KEYONLY, "no unresolved lines")
+    assert.equal(build({ ssh_conf: text }).ssh.policy, "keyonly")
+  }
 })
 
 // Where the machine has a real sshd, its own -T must agree with the panel's reading.
