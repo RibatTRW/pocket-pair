@@ -2,7 +2,6 @@
 # `commands.lint` and `commands.test` into .github/workflows/ci.yml.
 commands:
   test: "node --test test/*.test.mjs && bash -n scripts/install-moshi-hook.sh"
-  # qmllint lives in Qt6's declarative dev tools and is not always on PATH. Off
-  # an Omarchy machine the qs.Ui / qs.Commons imports cannot be resolved and
-  # qmllint reports them as warnings; the unresolvable-type categories are demoted to info, so it still fails on a real syntax error.
-  lint: 'QMLLINT="$(command -v qmllint || command -v qmllint6 || echo /usr/lib/qt6/bin/qmllint)"; "$QMLLINT" --import info --unqualified info --missing-property info --unresolved-type info --inheritance-cycle info --missing-type info --incompatible-type info --signal-handler-parameters info -W 0 BarWidget.qml Engine.qml Panel.qml'
+  # qmllint is not always on PATH, and off an Omarchy machine the qs.* imports
+  # cannot be resolved; scripts/lint-qml.sh fails only on real syntax errors.
+  lint: "bash scripts/lint-qml.sh BarWidget.qml Engine.qml Panel.qml"

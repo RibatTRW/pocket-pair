@@ -25,7 +25,7 @@ jobs:
 
       - name: Lint
         run: |
-          QMLLINT="$(command -v qmllint || command -v qmllint6 || echo /usr/lib/qt6/bin/qmllint)"; "$QMLLINT" --import info --unqualified info --missing-property info --unresolved-type info --inheritance-cycle info --missing-type info --incompatible-type info --signal-handler-parameters info -W 0 BarWidget.qml Engine.qml Panel.qml
+          bash scripts/lint-qml.sh BarWidget.qml Engine.qml Panel.qml
 
       - name: Test
         run: |
