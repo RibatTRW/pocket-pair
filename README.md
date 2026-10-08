@@ -50,10 +50,12 @@ That removes the plugin only. It does not uninstall `moshi-hook`, `mosh`, or und
 
 Runs [`scripts/install-moshi-hook.sh`](scripts/install-moshi-hook.sh). It does what Moshi's installer does, without piping a download into a shell:
 
-- reads the latest version from `https://cdn.getmoshi.app/hook/latest/version.txt`
+- installs a pinned release (currently `v0.4.20`) rather than whatever is latest
 - downloads `moshi-hook_Linux_<arch>.tar.gz` and `checksums.txt` for that version from `cdn.getmoshi.app`
-- **refuses to install unless the SHA-256 matches** `checksums.txt` (Moshi's own script skips the check if the file is missing; this one does not)
+- **refuses to install unless the SHA-256 matches** both the hash embedded in the script and `checksums.txt` (Moshi's own script skips the check if the file is missing; this one does not)
 - installs to `~/.local/bin/moshi-hook` (plus a `moshi` alias) and runs `moshi-hook service install` to start the background service
+
+To bump the pin, edit `VERSION` and the two `SHA256_*` values at the top of the script, copying the hashes from `https://cdn.getmoshi.app/hook/<version>/checksums.txt`.
 
 It skips Moshi's interactive first-run settings; run `moshi-hook set --first-run` later if you want them. Later updates use `moshi-hook update` (the panel offers it when a newer version exists).
 
