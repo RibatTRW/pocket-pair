@@ -14,7 +14,9 @@ set -euo pipefail
 # Pinned release. To bump: set VERSION, then copy the two Linux hashes from
 # https://cdn.getmoshi.app/hook/<VERSION>/checksums.txt (v0.4.20 shown).
 VERSION=v0.4.20
+# shellcheck disable=SC2034  # read indirectly via ${!pinned_var}
 SHA256_x86_64=2500dad1e771562648db984229269490064aab092ca2987cde0b42d611d3efef
+# shellcheck disable=SC2034
 SHA256_arm64=a878e335b1b7eee411cb2cbbc51b33dc9a6303f8088c2267e8831c102f31ebdc
 
 cdn="${POCKET_PAIR_CDN:-https://cdn.getmoshi.app}"
