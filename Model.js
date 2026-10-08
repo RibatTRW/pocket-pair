@@ -14,7 +14,26 @@ var GLYPHS = {
 }
 
 var PAIR_SECONDS = 300
-var CHECK_KEYS = ["hook_path", "hook_version", "daemon", "mosh", "sshd", "ts_status", "ts_prefs"]
+var CHECK_KEYS = ["hook_path", "hook_version", "daemon", "mosh", "sshd", "ts_bin", "ts_status", "ts_prefs",
+  "ufw", "lan_routes", "lan_addrs", "lan_subnets"]
+
+// How the phone reaches this machine: over a tailnet (recommended), or over
+// the home network when the phone is on the same Wi-Fi.
+var MODES = ["tailscale", "lan"]
+var MODE_TAILSCALE = "tailscale"
+var MODE_LAN = "lan"
+
+// The ports Moshi needs open on the home network: SSH, and Mosh's UDP range.
+var SSH_PORT = "22"
+var MOSH_PORTS = "60000:61000"
+// One subnet per line, appended by the firewall step once its rules went in
+// and removed by the matching close step. It is the record of what this plugin
+// opened (no root needed to read it back, unlike `ufw status`).
+var LAN_SUBNETS = "~/.local/state/pocket-pair/lan-subnets"
+
+function normalizeMode(value) {
+  return String(value || "") === MODE_LAN ? MODE_LAN : MODE_TAILSCALE
+}
 
 // "moshi-hook version 0.4.15", "v0.4.20" and "0.4.20\n" all mean a version.
 function parseVersion(text) {
@@ -55,10 +74,12 @@ function parseJson(text) {
 
 // ssh is null when the prefs could not be read; the pairing step then lets
 // moshi-hook's own prerequisite check have the final word.
-function parseTailscale(statusText, prefsText) {
+// installed is "yes" when the tailscale binary exists, so a stopped daemon
+// reads as "not connected" rather than "not installed".
+function parseTailscale(statusText, prefsText, installed) {
   var status = parseJson(statusText)
   var prefs = parseJson(prefsText)
-  var result = { state: "missing", ip: "", ssh: null }
+  var result = { state: installed === "yes" ? "down" : "missing", ip: "", ssh: null }
   if (!status) return result
   var backend = String(status.BackendState || "")
   result.state = backend === "Running" ? "running" : "down"
@@ -71,11 +92,116 @@ function parseTailscale(statusText, prefsText) {
   return result
 }
 
+function ipv4ToInt(text) {
+  var match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(text || ""))
+  if (!match) return -1
+  var value = 0
+  for (var i = 1; i <= 4; i++) {
+    var octet = parseInt(match[i], 10)
+    if (octet > 255) return -1
+    value = value * 256 + octet
+  }
+  return value
+}
+
+function intToIpv4(value) {
+  return [Math.floor(value / 16777216) % 256, Math.floor(value / 65536) % 256,
+    Math.floor(value / 256) % 256, value % 256].join(".")
+}
+
+// RFC 1918, and no wider than the private block itself, so a /7 that happens
+// to contain 10.x is never accepted as "your home network".
+function isPrivateSubnet(base, prefix) {
+  var blocks = [[ipv4ToInt("10.0.0.0"), 8], [ipv4ToInt("172.16.0.0"), 12], [ipv4ToInt("192.168.0.0"), 16]]
+  for (var i = 0; i < blocks.length; i++) {
+    var size = Math.pow(2, 32 - blocks[i][1])
+    if (prefix >= blocks[i][1] && base >= blocks[i][0] && base < blocks[i][0] + size) return true
+  }
+  return false
+}
+
+// Finds the home-network address from the default route's interface:
+// `ip -j route show default` and `ip -j -4 addr show`. ok is true only with a
+// private address in a subnet that can be named; otherwise error says why.
+function parseLan(routesText, addrsText) {
+  var none = { ok: false, ip: "", subnet: "", prefix: 0, dev: "", error: "" }
+  var routes = parseJson(routesText)
+  var addrs = parseJson(addrsText)
+  if (!Array.isArray(routes) || routes.length === 0 || !Array.isArray(addrs)) {
+    none.error = "No home network found. Connect to Wi-Fi or Ethernet and this continues by itself."
+    return none
+  }
+  var best = null
+  routes.forEach(function(route) {
+    var dev = String(route.dev || "")
+    if (dev === "" || /^(tailscale|tun|tap|wg|ppp)/.test(dev)) return
+    var metric = typeof route.metric === "number" ? route.metric : 0
+    if (!best || metric < best.metric) best = { dev: dev, metric: metric }
+  })
+  if (!best) {
+    none.error = "No home network found. Connect to Wi-Fi or Ethernet and this continues by itself."
+    return none
+  }
+  none.dev = best.dev
+  var info = null
+  addrs.forEach(function(iface) {
+    if (iface.ifname !== best.dev || info) return
+    ;(iface.addr_info || []).forEach(function(a) {
+      if (!info && a.family === "inet" && a.scope === "global" && typeof a.prefixlen === "number") info = a
+    })
+  })
+  var ip = info ? ipv4ToInt(info.local) : -1
+  if (ip < 0) {
+    none.error = "No home-network address found on " + best.dev + "."
+    return none
+  }
+  var prefix = info.prefixlen
+  var size = Math.pow(2, 32 - prefix)
+  var base = Math.floor(ip / size) * size
+  var subnet = intToIpv4(base) + "/" + prefix
+  var result = { ok: false, ip: info.local, subnet: subnet, prefix: prefix, dev: best.dev, error: "" }
+  if (!isPrivateSubnet(ip, prefix)) {
+    result.error = "This connection (" + info.local + ") is not a home network address, so Pocket Pair will not open the firewall for it. Use Tailscale instead."
+    return result
+  }
+  if (prefix > 30) {
+    result.error = "Could not work out the subnet of " + info.local + ". Use Tailscale instead."
+    return result
+  }
+  result.ok = true
+  return result
+}
+
+// The recorded subnets arrive comma-joined. Each one ends up inside a shell
+// command, so only a canonical private IPv4 subnet is kept.
+function parseSubnets(text) {
+  var list = []
+  String(text || "").split(",").forEach(function(item) {
+    var match = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(item.trim())
+    if (!match) return
+    var base = ipv4ToInt(match[1])
+    var prefix = parseInt(match[2], 10)
+    if (base < 0 || prefix > 30 || !isPrivateSubnet(base, prefix)) return
+    var size = Math.pow(2, 32 - prefix)
+    if (base % size !== 0) return
+    var subnet = intToIpv4(base) + "/" + prefix
+    if (list.indexOf(subnet) < 0) list.push(subnet)
+  })
+  return list
+}
+
+function parseUfw(text) {
+  var state = String(text || "").trim()
+  return state === "active" ? "active" : state === "" || state === "missing" ? "missing" : "inactive"
+}
+
 function buildChecks(raw, latestText) {
   raw = raw || {}
   var version = parseVersion(raw.hook_version)
   var latest = parseVersion(latestText)
   var present = !!raw.hook_path && version !== ""
+  var lan = parseLan(raw.lan_routes, raw.lan_addrs)
+  var openSubnets = parseSubnets(raw.lan_subnets)
   return {
     hook: {
       present: present,
@@ -87,75 +213,164 @@ function buildChecks(raw, latestText) {
     daemon: raw.daemon === "active",
     mosh: raw.mosh === "yes",
     sshd: raw.sshd === "active",
-    tailscale: parseTailscale(raw.ts_status, raw.ts_prefs)
+    tailscale: parseTailscale(raw.ts_status, raw.ts_prefs, raw.ts_bin),
+    lan: lan,
+    ufw: parseUfw(raw.ufw),
+    openSubnets: openSubnets,
+    // The rules are "open" once the firewall step recorded this subnet.
+    firewallOpen: lan.ok && openSubnets.indexOf(lan.subnet) >= 0
   }
 }
 
-// The three commands that need root, in the order a first pairing needs them.
+// The commands that need root, in the order a first pairing needs them.
 // Fixed strings: the terminal shows these exact words and nothing is built
-// from machine output.
+// from machine output, except the firewall rules, whose only variable part is
+// a subnet that parseLan has already checked is a private IPv4 range.
 var FIXES = {
   mosh: { cmd: "sudo pacman -S mosh", why: "mosh-server, so the phone can use Mosh" },
   sshd: { cmd: "sudo systemctl enable --now sshd", why: "the SSH server Moshi connects to" },
   tsssh: { cmd: "sudo tailscale set --ssh=false", why: "so port 22 reaches sshd, not Tailscale" }
 }
 
-function pendingFixes(checks) {
+// Tailscale itself: install if missing, start the service, sign in.
+var TAILSCALE_INSTALL = { id: "ts-install", cmd: "sudo pacman -S tailscale", why: "Tailscale, the recommended way to reach this machine" }
+var TAILSCALE_ENABLE = { id: "ts-enable", cmd: "sudo systemctl enable --now tailscaled", why: "the Tailscale service" }
+var TAILSCALE_UP = { id: "ts-up", cmd: "sudo tailscale up", why: "sign in to your tailnet" }
+
+function tailscaleFixes(tailscale) {
+  var list = []
+  if (tailscale.state === "missing") list.push(TAILSCALE_INSTALL)
+  list.push(TAILSCALE_ENABLE)
+  list.push(TAILSCALE_UP)
+  return list
+}
+
+// The firewall rules for the home network. Every rule says `from <subnet>`;
+// there is deliberately no variant without it.
+function lanRules(subnet) {
+  return {
+    ssh: "sudo ufw allow from " + subnet + " to any port " + SSH_PORT + " proto tcp",
+    mosh: "sudo ufw allow from " + subnet + " to any port " + MOSH_PORTS + " proto udp",
+    sshDelete: "sudo ufw delete allow from " + subnet + " to any port " + SSH_PORT + " proto tcp",
+    moshDelete: "sudo ufw delete allow from " + subnet + " to any port " + MOSH_PORTS + " proto udp",
+    remember: "mkdir -p ~/.local/state/pocket-pair && { grep -qxF " + subnet + " " + LAN_SUBNETS + " 2>/dev/null || echo " + subnet + " >> " + LAN_SUBNETS + "; }",
+    forget: "sed -i \"\\|^" + subnet.replace(/\./g, "\\.") + "\\$|d\" " + LAN_SUBNETS
+  }
+}
+
+function firewallFixes(subnet) {
+  var rules = lanRules(subnet)
+  return [
+    { id: "fw-ssh", cmd: rules.ssh, why: "SSH from your home network only" },
+    { id: "fw-mosh", cmd: rules.mosh, why: "Mosh from your home network only" },
+    { id: "fw-note", cmd: rules.remember, why: "remember it is open (no root)" }
+  ]
+}
+
+// Closes every recorded subnet; each is forgotten only after both of its
+// deletes succeeded.
+function closeFixes(subnets) {
+  var list = []
+  subnets.forEach(function(subnet) {
+    var rules = lanRules(subnet)
+    list.push({ id: "fw-ssh-close", cmd: rules.sshDelete, why: "close SSH again for " + subnet })
+    list.push({ id: "fw-mosh-close", cmd: rules.moshDelete, why: "close Mosh again for " + subnet })
+    list.push({ id: "fw-note-close", cmd: rules.forget, why: "forget " + subnet + " (no root)" })
+  })
+  return list
+}
+
+function pendingFixes(checks, mode) {
   var list = []
   if (!checks.mosh) list.push({ id: "mosh", cmd: FIXES.mosh.cmd, why: FIXES.mosh.why })
   if (!checks.sshd) list.push({ id: "sshd", cmd: FIXES.sshd.cmd, why: FIXES.sshd.why })
-  if (checks.tailscale.ssh === true) list.push({ id: "tsssh", cmd: FIXES.tsssh.cmd, why: FIXES.tsssh.why })
+  if (normalizeMode(mode) === MODE_LAN) {
+    if (checks.ufw === "active" && checks.lan.ok && !checks.firewallOpen) {
+      list = list.concat(firewallFixes(checks.lan.subnet))
+    }
+  } else if (checks.tailscale.ssh === true) {
+    list.push({ id: "tsssh", cmd: FIXES.tsssh.cmd, why: FIXES.tsssh.why })
+  }
   return list
 }
 
 // The checklist the panel shows while something is still missing.
-function checklist(checks) {
-  var ts = checks.tailscale
-  var tsDetail = ts.state === "running" ? ts.ip
-    : ts.state === "missing" ? "not installed" : "not connected"
-  return [
-    {
-      id: "hook", label: "moshi-hook",
-      state: checks.hook.present ? "ok" : "todo",
-      detail: checks.hook.present ? checks.hook.version : "not installed"
-    },
-    {
+function checklist(checks, mode) {
+  var rows = [{
+    id: "hook", label: "moshi-hook",
+    state: checks.hook.present ? "ok" : "todo",
+    detail: checks.hook.present ? checks.hook.version : "not installed"
+  }]
+  if (normalizeMode(mode) === MODE_LAN) {
+    rows.push({
+      id: "lan", label: "Home network",
+      state: checks.lan.ok ? "ok" : "wait",
+      detail: checks.lan.ok ? checks.lan.subnet : "not found"
+    })
+  } else {
+    var ts = checks.tailscale
+    rows.push({
       id: "tailscale", label: "Tailscale",
       state: ts.state === "running" ? "ok" : "wait",
-      detail: tsDetail
-    },
-    {
-      id: "mosh", label: "mosh-server",
-      state: checks.mosh ? "ok" : "todo",
-      detail: checks.mosh ? "installed" : "missing"
-    },
-    {
-      id: "sshd", label: "SSH server",
-      state: checks.sshd ? "ok" : "todo",
-      detail: checks.sshd ? "running" : "not running"
-    },
-    {
+      detail: ts.state === "running" ? ts.ip : ts.state === "missing" ? "not installed" : "not connected"
+    })
+  }
+  rows.push({
+    id: "mosh", label: "mosh-server",
+    state: checks.mosh ? "ok" : "todo",
+    detail: checks.mosh ? "installed" : "missing"
+  })
+  rows.push({
+    id: "sshd", label: "SSH server",
+    state: checks.sshd ? "ok" : "todo",
+    detail: checks.sshd ? "running" : "not running"
+  })
+  if (normalizeMode(mode) === MODE_LAN) {
+    rows.push({
+      id: "firewall", label: "Firewall",
+      state: checks.ufw !== "active" || checks.firewallOpen ? "ok" : checks.lan.ok ? "todo" : "wait",
+      detail: checks.ufw !== "active" ? "not in use" : checks.firewallOpen ? "open to your network" : "closed"
+    })
+  } else {
+    rows.push({
       id: "tsssh", label: "Tailscale SSH",
-      state: ts.ssh === true ? "todo" : "ok",
-      detail: ts.ssh === true ? "on" : "off"
-    }
-  ]
+      state: checks.tailscale.ssh === true ? "todo" : "ok",
+      detail: checks.tailscale.ssh === true ? "on" : "off"
+    })
+  }
+  return rows
+}
+
+// The address the phone is paired against.
+function pairHost(checks, mode) {
+  if (normalizeMode(mode) === MODE_LAN) return checks.lan.ok ? checks.lan.ip : ""
+  return checks.tailscale.state === "running" ? checks.tailscale.ip : ""
 }
 
 // One primary action at a time. kind: install, fix, wait, pair, done.
-function nextStep(checks, hosts) {
+// A fix step carries `alt` when the other network option is worth offering.
+function nextStep(checks, hosts, mode) {
+  mode = normalizeMode(mode)
   if (!checks.hook.present) return { kind: "install", label: "Install helper" }
-  if (checks.tailscale.state !== "running") {
+  if (mode === MODE_LAN) {
+    if (!checks.lan.ok) return { kind: "wait", label: "Check again", hint: checks.lan.error }
+  } else if (checks.tailscale.state !== "running") {
     return {
-      kind: "wait", label: "Check again",
-      hint: checks.tailscale.state === "missing"
-        ? "Pocket Pair pairs over Tailscale. Install Tailscale and sign in; this continues by itself."
-        : "Tailscale is not connected. Connect it and this continues by itself."
+      kind: "fix", label: "Set up Tailscale", recommended: true,
+      hint: "Recommended: reach this machine from anywhere, with no firewall changes.",
+      fixes: tailscaleFixes(checks.tailscale),
+      alt: { mode: MODE_LAN, label: "Use my home network instead" }
     }
   }
-  var fixes = pendingFixes(checks)
+  var fixes = pendingFixes(checks, mode)
   if (fixes.length > 0) {
-    return { kind: "fix", label: fixes.length === 1 ? "Fix in a terminal" : "Set up in a terminal", fixes: fixes }
+    var firewall = fixes.some(function(fix) { return fix.id === "fw-ssh" })
+    return {
+      kind: "fix",
+      label: firewall && fixes.length === 3 ? "Open firewall for your home network"
+        : fixes.length === 1 ? "Fix in a terminal" : "Set up in a terminal",
+      fixes: fixes
+    }
   }
   if (hosts && hosts.length > 0) return { kind: "done", label: "Pair another phone" }
   return { kind: "pair", label: "Show QR" }
@@ -163,8 +378,8 @@ function nextStep(checks, hosts) {
 
 // A one-line script for the floating terminal: it prints every command before
 // running any of them, then stops at the first failure.
-function fixScript(fixes) {
-  var parts = ["echo 'Pocket Pair will run:'"]
+function fixScript(fixes, heading) {
+  var parts = ["echo '" + (heading || "Pocket Pair will run:") + "'"]
   fixes.forEach(function(fix) { parts.push("echo '  $ " + fix.cmd + "'") })
   parts.push("echo")
   parts.push(fixes.map(function(fix) { return fix.cmd }).join(" && "))
@@ -238,7 +453,10 @@ function scrub(text) {
 
 if (typeof module !== "undefined") {
   module.exports = {
-    GLYPHS: GLYPHS, PAIR_SECONDS: PAIR_SECONDS, FIXES: FIXES,
+    GLYPHS: GLYPHS, PAIR_SECONDS: PAIR_SECONDS, FIXES: FIXES, MODES: MODES,
+    normalizeMode: normalizeMode, parseLan: parseLan, parseSubnets: parseSubnets, parseUfw: parseUfw,
+    lanRules: lanRules, firewallFixes: firewallFixes, closeFixes: closeFixes,
+    tailscaleFixes: tailscaleFixes, pairHost: pairHost,
     parseVersion: parseVersion, compareVersions: compareVersions,
     parseCheckOutput: parseCheckOutput, parseTailscale: parseTailscale,
     buildChecks: buildChecks, pendingFixes: pendingFixes, checklist: checklist,

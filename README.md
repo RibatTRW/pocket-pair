@@ -45,12 +45,56 @@ Click the phone glyph in the bar. The panel runs every check on its own and show
 
 When everything is already in place it is one click to the QR. After pairing, the panel shows only the paired status and your paired phones, each with a revoke button. The bar glyph turns the theme accent while a phone is paired. Colours follow your Omarchy theme.
 
-Pairing is over your tailnet only: the phone connects to this machine's Tailscale address. Nothing is opened on your LAN or router.
+## Two ways to connect
+
+| | Tailscale (recommended) | Home network |
+| --- | --- | --- |
+| Works from | anywhere | the same Wi-Fi only |
+| Firewall | no change | opens SSH and Mosh to your own subnet |
+| Pairs against | this machine's Tailscale address | this machine's home-network address |
+
+**Tailscale is the recommended first choice**: it works away from home, needs no firewall change (Tailscale normally accepts traffic arriving on its own `tailscale0` interface ahead of ufw's rules), and nothing is exposed to your local network. When Tailscale is missing or signed out, the panel's main button is **Set up Tailscale**. It opens one terminal that prints, then runs:
+
+```sh
+sudo pacman -S tailscale              # skipped if it is already installed
+sudo systemctl enable --now tailscaled
+sudo tailscale up
+```
+
+Below it, a small **Use my home network instead** link switches to the home-network mode. The choice is saved in the widget's own setting (`network`), and **Use Tailscale instead (recommended)** switches back.
+
+### Home network mode
+
+For people without Tailscale. The panel runs the same checks (`mosh`, the SSH server) except Tailscale SSH, detects this machine's address and subnet from the default route's interface (`ip -j route`, `ip -j -4 addr`), and, if ufw is active, adds one step: **Open firewall for your home network**. It opens one terminal that prints the commands first, with your detected subnet (192.168.1.0/24 here is only an example):
+
+```sh
+sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 60000:61000 proto udp
+mkdir -p ~/.local/state/pocket-pair && { grep -qxF 192.168.1.0/24 ~/.local/state/pocket-pair/lan-subnets 2>/dev/null || echo 192.168.1.0/24 >> ~/.local/state/pocket-pair/lan-subnets; }
+```
+
+The last line adds the subnet to a list (one per line, no root) in `~/.local/state/pocket-pair/lan-subnets`, so the panel can tell the rules are in place; reading `ufw status` itself needs root. Every subnet you open is appended, so joining another Wi-Fi and opening it too never loses track of the first. Then it pairs with `moshi-hook host setup --json --host <your home-network address>`.
+
+- **Same Wi-Fi only.** The phone must be on this network. There is no port forwarding and no UPnP: Pocket Pair never sets either up and advises against it.
+- **Scoped, never "anywhere".** Every rule says `from <your subnet>`. Pocket Pair writes no rule without it, and does not edit `sshd_config`.
+- **Still key-only.** SSH on the network only accepts the key the phone pairs with.
+- **Refused when it is not a home network.** If the address is not private (RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), or no subnet can be worked out, the panel says so and does not offer the firewall step. IPv4 only.
+- If ufw is not installed or not active, no firewall step is shown.
+
+**To close the firewall again**, press **close the firewall again** in the panel. It shows whenever any subnet is recorded, in either mode and on any network, and closes exactly the recorded subnets. Switching from home network to Tailscale while rules are open asks whether to close them first. A terminal prints and runs, for each recorded subnet:
+
+```sh
+sudo ufw delete allow from 192.168.1.0/24 to any port 22 proto tcp
+sudo ufw delete allow from 192.168.1.0/24 to any port 60000:61000 proto udp
+sed -i "\|^192\.168\.1\.0/24\$|d" ~/.local/state/pocket-pair/lan-subnets
+```
+
+A subnet is removed from the list only after both of its deletes succeeded, and the deletes are safe to repeat. You can also run those lines yourself with your own subnet. Removing the plugin does not close them.
 
 ## Requirements
 
 - Omarchy with the shell plugin system (Omarchy 4)
-- Tailscale, signed in, on this machine and your phone
+- Either Tailscale, signed in, on this machine and your phone (recommended), or a phone on the same home network
 - `qrencode` (ships with Omarchy)
 
 ## Install
@@ -82,21 +126,21 @@ To bump the pin, edit `VERSION` and the two `SHA256_*` values at the top of the 
 
 It skips Moshi's interactive first-run settings; run `moshi-hook set --first-run` later if you want them. Later updates use `moshi-hook update` (the panel offers it when a newer version exists).
 
-### The three commands that need root
+### The commands that need root
 
-The panel never runs `sudo` itself. When one of these is needed it opens Omarchy's floating terminal, prints the exact commands, and the password prompt is sudo's own.
+The panel never runs `sudo` itself. When one of these is needed it opens Omarchy's floating terminal, prints the exact commands, and the password prompt is sudo's own. The Tailscale and home-network firewall commands are listed above; these are the common ones.
 
 | Command | Why |
 | --- | --- |
 | `sudo pacman -S mosh` | `moshi-hook host setup` requires `mosh-server`. |
 | `sudo systemctl enable --now sshd` | Omarchy ships OpenSSH but leaves it off, so the phone would have nothing to connect to. The Arch unit is `sshd` (Debian calls it `ssh`). |
-| `sudo tailscale set --ssh=false` | While Tailscale SSH is on, Tailscale answers port 22 on your tailnet itself, so the key Moshi adds to `~/.ssh/authorized_keys` would never be used. |
+| `sudo tailscale set --ssh=false` | Tailscale mode only. While Tailscale SSH is on, Tailscale answers port 22 on your tailnet itself, so the key Moshi adds to `~/.ssh/authorized_keys` would never be used. |
 
-Pocket Pair does not edit `sshd_config` or sudoers, and does not change the firewall. Omarchy's firewall (ufw) denies incoming connections by default and that is left alone. Tailscale normally accepts traffic arriving on its own `tailscale0` interface ahead of ufw's rules, so the tailnet-only path should not need a ufw change; this plugin does not verify that for you. If your phone still cannot connect after pairing, check your firewall rules for port 22.
+Pocket Pair does not edit `sshd_config` or sudoers. In Tailscale mode it does not change the firewall: Omarchy's firewall (ufw) denies incoming connections by default and that is left alone, and this plugin does not verify that Tailscale traffic gets through ahead of it. In home-network mode the only firewall change is the two scoped rules above. If your phone still cannot connect after pairing, check your firewall rules for port 22.
 
 ### Pairing and the QR
 
-The panel runs `moshi-hook host setup --json --host <your Tailscale address>` and draws the link it prints with `qrencode`. When the phone finishes, it runs `moshi-hook service restart`. Closing the panel or pressing Cancel stops the pairing session.
+The panel runs `moshi-hook host setup --json --host <your Tailscale or home-network address>` and draws the link it prints with `qrencode`. When the phone finishes, it runs `moshi-hook service restart`. Closing the panel or pressing Cancel stops the pairing session.
 
 **The QR is an access token**: anyone who scans it before it expires can claim SSH access to this machine. Pocket Pair never logs, saves, or copies the link, and passes it to `qrencode` through the environment rather than a command line. Do not share your screen while it is showing.
 
@@ -109,6 +153,7 @@ Removes the phone's key from `~/.ssh/authorized_keys` with `moshi-hook host revo
 | Key | Meaning |
 | --- | --- |
 | `hookBinary` | Path to `moshi-hook`. Leave blank to find it automatically. |
+| `network` | `tailscale` (default, recommended) or `lan` for the home network. The panel switches it for you. |
 
 ## Development
 
@@ -117,7 +162,7 @@ omarchy plugin validate .
 node --test test/*.test.mjs
 ```
 
-Pure logic (parsing, the next-step rules, the QR matrix) lives in `Model.js` and is covered by `test/model.test.mjs`. `Engine.qml` owns the processes, `Panel.qml` the UI.
+Pure logic (parsing, mode selection, subnet detection and refusal, the exact command strings, the next-step rules, the QR matrix) lives in `Model.js` and is covered by `test/model.test.mjs`. `Engine.qml` owns the processes, `Panel.qml` the UI.
 
 The running shell keeps serving the plugin code it first loaded, so to try an edit live, install a copy under a fresh plugin id (change `id` in `manifest.json` and `moduleName` in the QML) and remove it afterwards.
 

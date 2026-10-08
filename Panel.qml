@@ -29,6 +29,7 @@ Panel {
   readonly property bool resultView: pairState === "ready" || pairState === "error" || pairState === "expired"
 
   property string confirmRevokeId: ""
+  property bool confirmSwitch: false
 
   onOpenedChanged: {
     if (!engine) return
@@ -188,7 +189,8 @@ Panel {
           visible: root.pairState === "ready"
           width: parent.width
           wrapMode: Text.Wrap
-          text: "Paired. Your phone can now connect over Tailscale."
+          text: root.engine && root.engine.lanMode ? "Paired. Your phone can now connect while it is on this Wi-Fi."
+            : "Paired. Your phone can now connect over Tailscale."
           color: Color.accent
           font.family: Style.font.family
           font.pixelSize: Style.font.body
@@ -274,7 +276,7 @@ Panel {
           }
 
           Text {
-            visible: root.step.kind === "wait" && root.step.hint !== undefined
+            visible: root.step.hint !== undefined
             width: parent.width
             wrapMode: Text.Wrap
             text: root.step.hint || ""
@@ -305,7 +307,7 @@ Panel {
               delegate: Text {
                 required property var modelData
                 width: parent ? parent.width : 0
-                elide: Text.ElideRight
+                wrapMode: Text.WrapAnywhere
                 text: "$ " + modelData.cmd
                 color: root.textColor
                 font.family: Style.font.family
@@ -313,6 +315,19 @@ Panel {
                 textFormat: Text.PlainText
               }
             }
+          }
+
+          Text {
+            visible: root.engine && root.engine.lanMode
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "Home network works on the same Wi-Fi only. It opens SSH to your local network only"
+              + (root.engine && root.engine.checks.lan.ok ? " (" + root.engine.checks.lan.subnet + ")" : "")
+              + ", never to everyone. For access from anywhere, use Tailscale."
+            color: Color.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -332,7 +347,9 @@ Panel {
             && root.step.kind === "pair"
           width: parent.width
           wrapMode: Text.Wrap
-          text: "Everything is ready. Open Moshi on your phone, then show the code."
+          text: root.engine && root.engine.lanMode
+            ? "Everything is ready. Put your phone on this Wi-Fi, open Moshi, then show the code."
+            : "Everything is ready. Open Moshi on your phone, then show the code."
           color: root.textColor
           font.family: Style.font.family
           font.pixelSize: Style.font.body
@@ -358,6 +375,83 @@ Panel {
               root.engine.dismissPair()
               if (root.step.kind === "pair" || root.step.kind === "done") root.engine.startPair()
             } else root.primary()
+          }
+        }
+
+        // ------------------------------------------- network choice
+        // Tailscale stays the recommended path; the home network is offered
+        // quietly while Tailscale is missing or signed out, and in home-network
+        // mode there is always a way back.
+        Text {
+          readonly property bool offerLan: !!root.engine && !root.engine.lanMode && root.step.alt !== undefined
+          readonly property bool offerTailscale: !!root.engine && root.engine.lanMode
+          visible: (offerLan || offerTailscale) && !root.showingQr && root.pairState !== "starting"
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          text: offerLan ? root.step.alt.label : "Use Tailscale instead (recommended)"
+          color: Color.muted
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          font.underline: networkHover.containsMouse
+          textFormat: Text.PlainText
+
+          MouseArea {
+            id: networkHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: if (root.engine) {
+              root.engine.dismissPair()
+              if (root.engine.lanMode && root.engine.canCloseFirewall) root.confirmSwitch = true
+              else root.engine.setNetwork(root.engine.lanMode ? "tailscale" : "lan")
+            }
+          }
+        }
+
+        Column {
+          visible: root.confirmSwitch && !!root.engine && root.engine.canCloseFirewall && root.engine.lanMode
+          width: parent.width
+          spacing: 4
+
+          Text {
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "The firewall is still open to " + (root.engine ? root.engine.checks.openSubnets.join(", ") : "")
+              + ". Close it before switching?"
+            color: Color.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            textFormat: Text.PlainText
+          }
+
+          Repeater {
+            model: [
+              { label: "Close the firewall, then switch", close: true },
+              { label: "Switch and leave it open", close: false }
+            ]
+
+            delegate: Text {
+              required property var modelData
+              width: parent ? parent.width : 0
+              text: modelData.label
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.underline: choiceHover.containsMouse
+              textFormat: Text.PlainText
+
+              MouseArea {
+                id: choiceHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: if (root.engine) {
+                  root.confirmSwitch = false
+                  if (modelData.close) root.engine.closeFirewall()
+                  root.engine.setNetwork("tailscale")
+                }
+              }
+            }
           }
         }
 
@@ -459,6 +553,25 @@ Panel {
               cursorShape: Qt.PointingHandCursor
               onClicked: if (root.engine) root.engine.updateHelper()
             }
+          }
+        }
+
+        Text {
+          visible: root.engine && root.engine.canCloseFirewall && !root.confirmSwitch && !root.showingQr && root.pairState !== "starting"
+          width: parent.width
+          text: "close the firewall again"
+          color: Color.muted
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          font.underline: closeHover.containsMouse
+          textFormat: Text.PlainText
+
+          MouseArea {
+            id: closeHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: if (root.engine) root.engine.closeFirewall()
           }
         }
       }
