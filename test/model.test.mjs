@@ -627,7 +627,51 @@ test("key-only fix: writes the drop-in, verifies with sshd -T, then reloads a ru
   assert.equal(r.rc, 0, r.out)
   assert.match(r.content, /^# Written by Pocket Pair.*\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n$/)
   assert.equal(r.calls, "systemctl is-active --quiet sshd\nsystemctl reload sshd\n")
-  assert.match(r.out, /^Pocket Pair will run:\n {2}\$ printf /)
+  assert.match(r.out, /^Pocket Pair will run:\n {2}- Write \/etc\/ssh\/sshd_config\.d\/10-pocket-pair-keyonly\.conf/)
+  assert.doesNotMatch(r.out, /shopt|bash -c|printf|PocketPair/)
+})
+
+// What the panel and the terminal show before anything runs is a short list of
+// steps, never the script that follows: the sshd Include/Match scan is far
+// longer than the panel is wide.
+const everyFix = () => {
+  const checks = build({ ssh_conf: PASSWORDS, sshd: "inactive", mosh: "no" })
+  const sets = [
+    M.pendingFixes(checks, "lan"), M.keyOnlyFixes(), [M.sshCheckFix()], M.firewallFixes("192.168.1.0/24"),
+    M.closeFixes(["192.168.1.0/24", "10.0.0.0/8"]), M.tailscaleFixes({ state: "missing" }),
+    M.pendingFixes(build({ tailscale: "x", ts_prefs: '{"RunSSH": true}' }), "tailscale")
+  ]
+  return sets.flat()
+}
+
+test("preview: the key-only steps read as plain sentences, not as shell", () => {
+  const lines = [...M.keyOnlyFixes(), M.sshCheckFix(), M.firewallFixes("192.168.1.0/24")[0]].map(M.fixPreview)
+  assert.equal(lines.length, 6)
+  for (const line of lines) {
+    assert.match(line, /^- [A-Z]/)
+    assert.doesNotMatch(line, /shopt|bash -c|\$\(|\[\[|\{ |\|\||&&|printf|install -D/)
+  }
+  assert.equal(M.fixPreview(M.keyOnlyFixes()[1]), "- Check sshd accepts it (sudo sshd -t); if not, remove the file and stop")
+  assert.match(M.fixPreview(M.keyOnlyFixes()[2]), /sshd -T says keys only.*scan every file sshd includes \(as root\).*remove the file and stop/)
+  assert.match(M.fixPreview(M.sshCheckFix()), /stop before SSH is started/)
+  assert.match(M.fixPreview(M.firewallFixes("192.168.1.0/24")[0]), /stop before the firewall is opened/)
+})
+
+test("preview: a step without a sentence shows its short command; no line is longer than 160 characters", () => {
+  assert.equal(M.fixPreview({ cmd: "sudo pacman -S mosh" }), "$ sudo pacman -S mosh")
+  const fixes = everyFix()
+  assert.ok(fixes.length > 15)
+  for (const fix of fixes) assert.ok(M.fixPreview(fix).length <= 160, M.fixPreview(fix))
+})
+
+test("preview: the terminal prints the short steps, then runs the unchanged commands", () => {
+  const fixes = M.nextStep(build({ ssh_conf: PASSWORDS }), [], "lan").fixes
+  const script = M.fixScript(fixes, undefined, M.keyOnlyNotes(build({ ssh_conf: PASSWORDS })))
+  const [shown, ran] = script.split("; echo; ")
+  assert.ok(shown.length < 1500, "the echoed preview stays small: " + shown.length)
+  assert.doesNotMatch(shown, /shopt|bash -c/)
+  assert.equal(ran, fixes.map(f => f.cmd).join(" && "))
+  assert.ok(ran.includes(M.SSH_MATCH), "the root scan still runs inline, from this file's fixed text")
 })
 
 test("key-only fix: a stopped sshd is not reloaded (it starts with the file later)", () => {
