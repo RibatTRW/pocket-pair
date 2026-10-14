@@ -24,7 +24,7 @@ Every picture and clip below was captured from a throwaway Omarchy shell on a he
 | --- | --- |
 | The bar glyph, unpaired (top) and paired (bottom, theme accent) | ![Bar glyph unpaired and paired](media/bar-unpaired-paired.webp) |
 | 1. Checks run and the first missing piece is offered: install the helper | ![Install helper step](media/step-1-helper.webp) |
-| 2. One terminal for whatever needs root; it lists the exact commands first | ![Fix in a terminal step](media/step-2-fix.webp) |
+| 2. One terminal for whatever needs root; it lists the steps first | ![Fix in a terminal step](media/step-2-fix.webp) |
 | 3. Everything in place: one click to the QR | ![Ready, Show QR](media/step-3-ready.webp) |
 | 4. The QR with its five-minute countdown | ![QR with countdown](media/step-4-qr.webp) |
 | 5. After pairing: status and the paired phones, each with a revoke button | ![Paired status with device list](media/step-5-paired.webp) |
@@ -40,7 +40,7 @@ Every picture and clip below was captured from a throwaway Omarchy shell on a he
 Click the phone glyph in the bar. The panel runs every check on its own and shows one button for the next step:
 
 1. **Install helper**: downloads `moshi-hook` (no root needed).
-2. **Set up in a terminal**: only if something needs root. One terminal opens, prints the commands, then asks for your password.
+2. **Set up in a terminal**: only if something needs root. One terminal opens, prints the steps, then asks for your password.
 3. **Show QR**: scan it with the Moshi app. It expires after 5 minutes.
 
 When everything is already in place it is one click to the QR. After pairing, the panel shows only the paired status and your paired phones, each with a revoke button. The bar glyph turns the theme accent while a phone is paired. Colours follow your Omarchy theme.
@@ -88,7 +88,7 @@ Opening SSH to your network while passwords still work would let anyone on it tr
 - **What is checked.** Password and keyboard-interactive login must both be off, key login must not be off, and `AuthenticationMethods` must not require a password method. The panel reads the readable SSH config (`/etc/ssh/sshd_config` with its `Include` lines expanded, by [`scripts/read-sshd-config.sh`](scripts/read-sshd-config.sh)) with sshd's own rule that the first value wins. **Anything it cannot prove is treated as not key-only**: an unreadable file, an `Include` that points into a directory it cannot list, a too deeply nested or quoted include, an unusual value.
 - **When it cannot prove it, Pocket Pair stops.** If the panel cannot read or verify all of the configuration (an unreadable `Include`, even one outside `sshd_config.d`, could hold a `Match` block that allows passwords on your network), it offers no fix: it does not write the drop-in, and it does not start or reload SSH, whether or not ufw is active. The panel says which file or `Match` block to look at. The same goes for a `Match` block that touches sign-in (`PasswordAuthentication`, `KbdInteractiveAuthentication`, `AuthenticationMethods`, `PubkeyAuthentication`), which `sshd -T` does not evaluate. Review it yourself so it allows keys only and can be read without root, or use Tailscale; Pocket Pair never edits it. The checklist row reads **not verified: review by hand** or **Match block: review by hand**.
 - **Asked of sshd itself, as root.** The terminal steps run `sudo sshd -T`, which prints the effective configuration, and require the same four lines. `sshd -T` reports the global values only, and a `Match` block overrides them for the connections it matches, so the same check also reads every file sshd reads, as root: `sshd_config` and each `Include`, recursively and in place (an `Include` inside a `Match` block stays inside it). It fails, naming the file or line to review, on a `Match` block with a sign-in keyword in it, a quoted `Include`, includes nested past sshd's limit of 16, or a file it cannot read. The root check is the last word, whatever the panel showed: the firewall step runs it as its first command, so the rules are never added if it fails, and a stopped sshd is not started (`sudo systemctl enable --now sshd`) until it has passed, even if the panel was out of date.
-- **If SSH is not key-only**, the panel offers **Make SSH keys-only**. One terminal prints these commands, then asks for your password (`sudo`). It runs them in order and stops at the first failure:
+- **If SSH is not key-only**, the panel offers **Make SSH keys-only**. One terminal prints a short list of the steps (the panel shows the same list), then asks for your password (`sudo`). The list says what each step does instead of printing the long scan command; the commands it then runs, in order and stopping at the first failure, are:
 
 ```sh
 printf "%s\n" "# Written by Pocket Pair: SSH accepts keys only. Delete this file and run sudo systemctl reload sshd to allow passwords again." "PasswordAuthentication no" "KbdInteractiveAuthentication no" | sudo install -Dm644 /dev/stdin /etc/ssh/sshd_config.d/10-pocket-pair-keyonly.conf
@@ -149,7 +149,7 @@ It skips Moshi's interactive first-run settings; run `moshi-hook set --first-run
 
 ### The commands that need root
 
-The panel never runs `sudo` itself. When one of these is needed it opens Omarchy's floating terminal, prints the exact commands, and the password prompt is sudo's own. The Tailscale and home-network firewall commands are listed above; these are the common ones.
+The panel never runs `sudo` itself. When one of these is needed it opens Omarchy's floating terminal, prints each step (the command itself when it is short, a one-line description for the long SSH root checks below), and the password prompt is sudo's own. The Tailscale and home-network firewall commands are listed above; these are the common ones.
 
 | Command | Why |
 | --- | --- |

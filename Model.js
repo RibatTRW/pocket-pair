@@ -409,6 +409,11 @@ var SSH_MATCH = "sudo bash -c 'shopt -s nocasematch nullglob; r=$1; bad=0; m=0; 
 var SSH_VERIFY = "[ \"$(sudo sshd -T | grep -ixcE \"(passwordauthentication|kbdinteractiveauthentication) no"
   + "|pubkeyauthentication yes|authenticationmethods (any|publickey)\")\" = 4 ] && " + SSH_MATCH
 
+// What the panel and the terminal say about a step whose command is too long to
+// read (the sshd -T count plus the root scan above). Plain words only: the
+// command itself is unchanged and is what runs.
+var SHOW_VERIFY = "Check sshd -T says keys only, and scan every file sshd includes (as root)"
+
 // Every command is fixed text. A failing check removes only Pocket Pair's own
 // file again, says why, and stops the chain (the `false`), so nothing after it
 // runs. Existing SSH sessions are not cut: the reload only applies to new ones.
@@ -420,25 +425,29 @@ function keyOnlyFixes() {
       cmd: "printf \"%s\\n\" \"# Written by Pocket Pair: SSH accepts keys only. Delete this file and run"
         + " sudo systemctl reload sshd to allow passwords again.\" \"PasswordAuthentication no\""
         + " \"KbdInteractiveAuthentication no\" | sudo install -Dm644 /dev/stdin " + SSH_DROPIN,
-      why: "turn off password sign-in for SSH (keys only)"
+      why: "turn off password sign-in for SSH (keys only)",
+      show: "Write " + SSH_DROPIN + " (passwords off)"
     },
     {
       id: "ssh-test",
       cmd: "sudo sshd -t || { " + remove + "; echo \"sshd rejected its configuration. Pocket Pair removed"
         + " its file and changed nothing else.\"; false; }",
-      why: "check sshd accepts its configuration"
+      why: "check sshd accepts its configuration",
+      show: "Check sshd accepts it (sudo sshd -t); if not, remove the file and stop"
     },
     {
       id: "ssh-verify",
       cmd: SSH_VERIFY + " || { " + remove + "; echo \"sshd is not keys only after all: an earlier rule overrides the"
         + " Pocket Pair file, AuthenticationMethods allows more, an included file could not be read, or a Match block touches sign-in."
         + " The file was removed and SSH was not started or reloaded. Review that yourself, or use Tailscale.\"; false; }",
-      why: "confirm sshd really is keys only now"
+      why: "confirm sshd really is keys only now",
+      show: SHOW_VERIFY + "; if not, remove the file and stop"
     },
     {
       id: "ssh-reload",
       cmd: "{ ! systemctl is-active --quiet sshd || sudo systemctl reload sshd; }",
-      why: "apply it to new connections (open sessions stay)"
+      why: "apply it to new connections (open sessions stay)",
+      show: "Reload sshd, if it is running (open sessions stay)"
     }
   ]
 }
@@ -450,7 +459,8 @@ function sshCheckFix() {
     id: "ssh-check",
     cmd: SSH_VERIFY + " || { echo \"SSH could not be verified as keys only (a file it could not read, or a Match block"
       + " that touches sign-in), so it was not started.\"; false; }",
-    why: "make sure SSH accepts keys only before starting it"
+    why: "make sure SSH accepts keys only before starting it",
+    show: SHOW_VERIFY + "; if not, stop before SSH is started"
   }
 }
 
@@ -492,11 +502,13 @@ function firewallFixes(subnet) {
     {
       id: "fw-check",
       cmd: SSH_VERIFY + " || { echo \"SSH does not accept keys only (or a file could not be read, or a Match block touches sign-in), so the firewall was not opened.\"; false; }",
-      why: "make sure SSH accepts keys only before opening it"
+      why: "make sure SSH accepts keys only before opening it",
+      show: SHOW_VERIFY + "; if not, stop before the firewall is opened"
     },
     { id: "fw-ssh", cmd: rules.ssh, why: "SSH from your home network only" },
     { id: "fw-mosh", cmd: rules.mosh, why: "Mosh from your home network only" },
-    { id: "fw-note", cmd: rules.remember, why: "remember it is open (no root)" }
+    { id: "fw-note", cmd: rules.remember, why: "remember it is open (no root)",
+      show: "Remember " + subnet + " in " + LAN_SUBNETS + " (no root)" }
   ]
 }
 
@@ -508,7 +520,8 @@ function closeFixes(subnets) {
     var rules = lanRules(subnet)
     list.push({ id: "fw-ssh-close", cmd: rules.sshDelete, why: "close SSH again for " + subnet })
     list.push({ id: "fw-mosh-close", cmd: rules.moshDelete, why: "close Mosh again for " + subnet })
-    list.push({ id: "fw-note-close", cmd: rules.forget, why: "forget " + subnet + " (no root)" })
+    list.push({ id: "fw-note-close", cmd: rules.forget, why: "forget " + subnet + " (no root)",
+      show: "Forget " + subnet + " in " + LAN_SUBNETS + " (no root)" })
   })
   return list
 }
@@ -659,14 +672,21 @@ function nextStep(checks, hosts, mode) {
   return { kind: "pair", label: "Show QR" }
 }
 
-// A one-line script for the floating terminal: it prints every command before
+// One line of the preview of a step, for the panel and the terminal. A short
+// command is shown as is. A step with a `show` text (its command is a long
+// script) is shown as that sentence instead, never as the script.
+function fixPreview(fix) {
+  return fix.show !== undefined ? "- " + fix.show : "$ " + fix.cmd
+}
+
+// A one-line script for the floating terminal: it prints every step before
 // running any of them, then stops at the first failure. `notes` are printed
 // first, for what the user should know before the password prompt.
 function fixScript(fixes, heading, notes) {
   var say = function(text) { return "echo '" + String(text).replace(/'/g, "'\\''") + "'" }
   var parts = [say(heading || "Pocket Pair will run:")]
   ;(notes || []).forEach(function(note) { parts.push(say(note)) })
-  fixes.forEach(function(fix) { parts.push(say("  $ " + fix.cmd)) })
+  fixes.forEach(function(fix) { parts.push(say("  " + fixPreview(fix))) })
   parts.push("echo")
   parts.push(fixes.map(function(fix) { return fix.cmd }).join(" && "))
   return parts.join("; ")
@@ -742,7 +762,7 @@ if (typeof module !== "undefined") {
     GLYPHS: GLYPHS, PAIR_SECONDS: PAIR_SECONDS, FIXES: FIXES, MODES: MODES,
     normalizeMode: normalizeMode, parseLan: parseLan, parseSubnets: parseSubnets, parseUfw: parseUfw,
     parseSshPolicy: parseSshPolicy, analyzeSshConfig: analyzeSshConfig, sshCheckFix: sshCheckFix, parseKeyCount: parseKeyCount, keyOnlyFixes: keyOnlyFixes,
-    keyOnlyNotes: keyOnlyNotes, canPair: canPair, SSH_DROPIN: SSH_DROPIN, SSH_VERIFY: SSH_VERIFY, SSH_MATCH: SSH_MATCH,
+    keyOnlyNotes: keyOnlyNotes, fixPreview: fixPreview, canPair: canPair, SSH_DROPIN: SSH_DROPIN, SSH_VERIFY: SSH_VERIFY, SSH_MATCH: SSH_MATCH,
     lanRules: lanRules, firewallFixes: firewallFixes, closeFixes: closeFixes,
     tailscaleFixes: tailscaleFixes, pairHost: pairHost,
     parseVersion: parseVersion, compareVersions: compareVersions,
