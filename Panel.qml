@@ -9,6 +9,11 @@ import "Model.js" as Model
 // helper, then one terminal for whatever needs root, then Show QR. Once a
 // phone is paired it shrinks to the paired status and the list of phones.
 //
+// The main page stays short: a hero header, the checks as status chips, and
+// the current step in a title and one sentence above its button. Everything
+// longer (the steps that run, why, how to undo) is on the Details page,
+// word for word, and the main page still says when a step asks for sudo.
+//
 // Loaded by BarWidget.qml, not declared as a second plugin kind. It owns no
 // state: everything comes from the engine on the bar widget.
 
@@ -22,12 +27,34 @@ Panel {
   readonly property var engine: hostWidget ? hostWidget.engine : null
 
   readonly property color textColor: root.barForeground
+  // Secondary text, as PanelHero and PanelSectionHeader dim it: readable on
+  // the panel background, unlike Color.muted, which stays for small captions.
+  readonly property color dimColor: Qt.darker(textColor, 1.4)
   readonly property string pairState: engine ? engine.pairState : "idle"
   readonly property bool showingQr: pairState === "waiting" && engine && engine.qrSize > 0
   readonly property var step: engine ? engine.step : ({ kind: "wait", label: "Check again" })
   readonly property bool ready: step.kind === "pair" || step.kind === "done"
   // A pairing result replaces the setup view until the user dismisses it.
   readonly property bool resultView: pairState === "ready" || pairState === "error" || pairState === "expired"
+  // The view for the current step: everything except the QR, a starting
+  // session and a pairing result.
+  readonly property bool setupView: !!engine && !resultView && !showingQr && pairState !== "starting"
+
+  readonly property string mode: engine && engine.lanMode ? "lan" : "tailscale"
+  readonly property var summary: engine ? Model.stepSummary(step, engine.checks, mode) : ({ title: "", glyph: "", line: "" })
+  readonly property var details: engine ? Model.stepDetails(step, engine.checks, mode)
+    : ({ runs: [], sudo: false, whyTitle: "", why: [], undo: "" })
+  readonly property bool hasDetails: details.runs.length > 0 || details.why.length > 0
+  readonly property int todoCount: engine && engine.checked
+    ? engine.checklist.filter(function(row) { return row.state !== "ok" }).length : 0
+
+  // The Details page replaces the main page until Back. A new step closes
+  // it, so it never shows the steps of something that already happened.
+  property bool detailsOpen: false
+  readonly property bool showingDetails: detailsOpen && setupView && hasDetails
+  readonly property string stepKey: step.kind + ":" + step.label
+  onStepKeyChanged: detailsOpen = false
+  onShowingDetailsChanged: panelFlick.contentY = 0
 
   property string confirmRevokeId: ""
   property bool confirmSwitch: false
@@ -41,6 +68,7 @@ Panel {
       // Close always cancels a session: the link must not outlive the view.
       engine.dismissPair()
       confirmRevokeId = ""
+      detailsOpen = false
     }
   }
 
@@ -64,6 +92,47 @@ Panel {
     }
   }
 
+  // One check as a small bordered pill: its state as a glyph, then a short
+  // label. Built the way PanelHero builds its own detail pill. Anything not
+  // done is filled, so what is left stands out.
+  component StatusChip: BorderSurface {
+    id: chip
+    property string glyph: ""
+    property string label: ""
+    property bool done: true
+    property color foreground: Color.foreground
+    readonly property color ink: done ? Qt.darker(foreground, 1.4) : foreground
+    implicitWidth: chipRow.implicitWidth + Style.space(12)
+    implicitHeight: chipRow.implicitHeight + Style.space(6)
+    radius: Style.cornerRadius
+    color: done ? "transparent" : Style.hoverFillFor(foreground, Color.accent)
+    borderSpec: Border.controlSpec(done ? "hover-cursor" : "normal", foreground, Color.accent)
+
+    Row {
+      id: chipRow
+      anchors.centerIn: parent
+      spacing: Style.space(5)
+
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        text: chip.glyph
+        color: chip.ink
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        textFormat: Text.PlainText
+      }
+
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        text: chip.label
+        color: chip.ink
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        textFormat: Text.PlainText
+      }
+    }
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -77,10 +146,16 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      // Esc and Left leave the Details page first; Right opens it.
+      onCloseRequested: {
+        if (root.showingDetails) root.detailsOpen = false
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onActivateRequested: root.primary()
       onMoveRequested: function(dx, dy) {
+        if (dx > 0 && root.setupView && root.hasDetails) root.detailsOpen = true
+        if (dx < 0) root.detailsOpen = false
         if (dy !== 0)
           panelFlick.contentY = Math.max(0, Math.min(panelFlick.contentHeight - panelFlick.height,
                                                      panelFlick.contentY + dy * Style.space(56)))
@@ -104,33 +179,57 @@ Panel {
           width: panelFlick.width
           spacing: Style.spacing.xl
 
-          // ------------------------------------------------------- header
-          Item {
+          // --------------------------------------------------------- hero
+          PanelHero {
+            visible: !root.showingDetails
             width: parent.width
-            height: title.implicitHeight
-
-            Text {
-              id: title
-              anchors.left: parent.left
-              text: "POCKET PAIR"
-              color: Color.accent
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1
-              textFormat: Text.PlainText
+            title: "Pocket Pair"
+            meta: root.engine ? Model.networkLine(root.engine.checks, root.mode) : ""
+            detail: !root.engine || !root.engine.checked ? ""
+              : root.pairState === "waiting" ? "waiting"
+              : !root.ready ? (root.todoCount > 0 ? root.todoCount + " to do" : "setup")
+              : root.engine.paired ? root.engine.hosts.length + " paired" : "ready"
+            foreground: root.textColor
+            iconOpacity: root.engine && root.engine.paired ? 1.0 : 0.6
+            iconComponent: Component {
+              Text {
+                text: Model.GLYPHS.phone
+                color: root.engine && root.engine.paired ? Color.accent : root.textColor
+                font.family: Style.font.family
+                font.pixelSize: Style.font.display
+                textFormat: Text.PlainText
+              }
             }
+          }
 
-            Text {
-              anchors.right: parent.right
-              text: root.pairState === "waiting" ? "waiting for your phone"
-                : !root.ready ? "needs setup"
-                : root.engine && root.engine.paired ? "paired" : "ready"
-              color: Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              textFormat: Text.PlainText
+          // ------------------------------------------------------- chips
+          // Shown only while something is missing; once everything is ready
+          // the hero says so instead.
+          Flow {
+            visible: root.setupView && !root.showingDetails && !root.ready
+              && !!root.engine && root.engine.checked
+            width: parent.width
+            spacing: Style.spacing.md
+
+            Repeater {
+              model: root.engine && root.engine.checked ? root.engine.checklist : []
+
+              delegate: StatusChip {
+                required property var modelData
+                foreground: root.textColor
+                done: modelData.state === "ok"
+                glyph: modelData.state === "ok" ? Model.GLYPHS.check
+                  : modelData.state === "wait" ? Model.GLYPHS.circle : Model.GLYPHS.cross
+                label: modelData.chip
+              }
             }
+          }
+
+          PanelSeparator {
+            visible: root.setupView && !root.showingDetails && !root.ready
+              && !!root.engine && root.engine.checked
+            width: parent.width
+            foreground: root.textColor
           }
 
           // ------------------------------------------------- QR (waiting)
@@ -238,112 +337,49 @@ Panel {
             textFormat: Text.PlainText
           }
 
-          // ------------------------------------------------- checklist
-          // Shown only while something is missing; once everything is ready
-          // the panel says so in one line instead.
+          // ------------------------------------------------ current step
           Column {
-            visible: !root.resultView && !root.showingQr && root.pairState !== "starting" && !root.ready
+            visible: root.setupView && !root.showingDetails && root.step.kind !== "done"
+              && !!root.engine && root.engine.checked
             width: parent.width
             spacing: Style.spacing.md
 
-            Repeater {
-              model: root.engine && root.engine.checked ? root.engine.checklist : []
-
-              delegate: Item {
-                id: row
-                required property var modelData
-                width: parent ? parent.width : 0
-                height: Math.max(rowLabel.implicitHeight, rowDetail.implicitHeight)
-
-                Text {
-                  id: dot
-                  anchors.left: parent.left
-                  anchors.verticalCenter: rowLabel.verticalCenter
-                  text: row.modelData.state === "ok" ? Model.GLYPHS.ok
-                    : row.modelData.state === "wait" ? Model.GLYPHS.wait : Model.GLYPHS.todo
-                  color: row.modelData.state === "ok" ? Color.accent : Color.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  textFormat: Text.PlainText
-                }
-
-                Text {
-                  id: rowLabel
-                  anchors.left: dot.right
-                  anchors.leftMargin: Style.spacing.lg
-                  text: row.modelData.label
-                  color: row.modelData.state === "ok" ? Color.muted : root.textColor
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.body
-                  textFormat: Text.PlainText
-                }
-
-                Text {
-                  id: rowDetail
-                  anchors.right: parent.right
-                  anchors.left: rowLabel.right
-                  anchors.leftMargin: Style.spacing.lg
-                  horizontalAlignment: Text.AlignRight
-                  elide: Text.ElideRight
-                  text: row.modelData.detail
-                  color: Color.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  textFormat: Text.PlainText
-                }
-              }
-            }
-
-            Text {
-              visible: root.step.hint !== undefined
+            Item {
               width: parent.width
-              wrapMode: Text.Wrap
-              text: root.step.hint || ""
-              color: Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              textFormat: Text.PlainText
-            }
-
-            Column {
-              visible: root.step.kind === "fix"
-              width: parent.width
-              spacing: Style.spacing.xs
+              height: stepTitle.implicitHeight
 
               Text {
-                width: parent.width
-                wrapMode: Text.Wrap
-                text: "A terminal opens, shows these steps, then asks for your password:"
-                color: Color.muted
+                id: stepGlyph
+                width: Style.space(20)
+                anchors.verticalCenter: stepTitle.verticalCenter
+                text: root.summary.glyph
+                color: Color.accent
                 font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
+                font.pixelSize: Style.font.title
                 textFormat: Text.PlainText
               }
 
-              Repeater {
-                model: root.step.fixes || []
-
-                delegate: Text {
-                  required property var modelData
-                  width: parent ? parent.width : 0
-                  wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                  text: Model.fixPreview(modelData)
-                  color: root.textColor
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  textFormat: Text.PlainText
-                }
+              Text {
+                id: stepTitle
+                anchors.left: stepGlyph.right
+                anchors.leftMargin: Style.spacing.md
+                anchors.right: parent.right
+                wrapMode: Text.Wrap
+                text: root.summary.title
+                color: root.textColor
+                font.family: Style.font.family
+                font.pixelSize: Style.font.subtitle
+                font.bold: true
+                textFormat: Text.PlainText
               }
             }
 
             Text {
-              visible: root.engine && root.engine.lanMode
+              visible: text !== ""
               width: parent.width
               wrapMode: Text.Wrap
-              text: "Home network works on the same Wi-Fi only. It opens SSH to your local network only"
-                + (root.engine && root.engine.checks.lan.ok ? " (" + root.engine.checks.lan.subnet + ")" : "")
-                + ", never to everyone, and only once SSH is verified to accept keys only (never passwords). If Pocket Pair cannot read or verify all of your SSH configuration, it stops and does not start or reload SSH. For access from anywhere, use Tailscale."
-              color: Color.muted
+              text: root.summary.line
+              color: root.dimColor
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
               textFormat: Text.PlainText
@@ -361,21 +397,117 @@ Panel {
             }
           }
 
-          Text {
-            visible: !root.resultView && !root.showingQr && root.pairState !== "starting"
-              && root.step.kind === "pair"
+          // ------------------------------------------------- details page
+          Column {
+            visible: root.showingDetails
             width: parent.width
-            wrapMode: Text.Wrap
-            text: root.engine && root.engine.lanMode
-              ? "Everything is ready: SSH accepts keys only. Put your phone on this Wi-Fi, open Moshi, then show the code."
-              : "Everything is ready. Open Moshi on your phone, then show the code."
-            color: root.textColor
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-            textFormat: Text.PlainText
+            spacing: Style.spacing.xl
+
+            Item {
+              width: parent.width
+              height: backButton.implicitHeight
+
+              Button {
+                id: backButton
+                anchors.left: parent.left
+                iconText: Model.GLYPHS.back
+                text: "Back"
+                fontSize: Style.font.caption
+                foreground: root.textColor
+                onClicked: root.detailsOpen = false
+              }
+
+              Text {
+                anchors.left: backButton.right
+                anchors.leftMargin: Style.spacing.lg
+                anchors.right: parent.right
+                anchors.verticalCenter: backButton.verticalCenter
+                horizontalAlignment: Text.AlignRight
+                elide: Text.ElideRight
+                text: root.summary.title
+                color: root.dimColor
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                textFormat: Text.PlainText
+              }
+            }
+
+            Column {
+              visible: root.details.runs.length > 0
+              width: parent.width
+              spacing: Style.spacing.sm
+
+              PanelSectionHeader { text: "WHAT RUNS"; foreground: root.textColor }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: "A terminal opens, shows these steps, then asks for your password:"
+                color: root.dimColor
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                textFormat: Text.PlainText
+              }
+
+              Repeater {
+                model: root.details.runs
+
+                delegate: Text {
+                  required property string modelData
+                  width: parent ? parent.width : 0
+                  wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                  text: modelData
+                  color: root.textColor
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  textFormat: Text.PlainText
+                }
+              }
+            }
+
+            PanelSeparator {
+              visible: root.details.runs.length > 0 && root.details.why.length > 0
+              width: parent.width
+              foreground: root.textColor
+            }
+
+            Column {
+              visible: root.details.why.length > 0
+              width: parent.width
+              spacing: Style.spacing.sm
+
+              PanelSectionHeader { text: root.details.whyTitle; foreground: root.textColor }
+
+              Repeater {
+                model: root.details.why
+
+                delegate: Text {
+                  required property string modelData
+                  width: parent ? parent.width : 0
+                  wrapMode: Text.Wrap
+                  text: modelData
+                  color: root.dimColor
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  textFormat: Text.PlainText
+                }
+              }
+
+              Text {
+                visible: root.details.undo !== ""
+                width: parent.width
+                wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                text: root.details.undo
+                color: root.dimColor
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                textFormat: Text.PlainText
+              }
+            }
           }
 
           // --------------------------------------------- primary button
+          // One button for both pages, so Details always ends in the action.
           Button {
             id: primaryButton
             width: parent.width
@@ -383,6 +515,9 @@ Panel {
             bordered: true
             foreground: Color.accent
             focusable: true
+            // A lock when the step's terminal asks for sudo.
+            iconText: root.setupView && root.details.sudo && !(root.engine && root.engine.installLine !== "")
+              ? Model.GLYPHS.lock : ""
             text: root.resultView ? (root.pairState === "ready" ? "Done" : "Try again")
               : root.showingQr || root.pairState === "starting" ? "Cancel"
               : root.engine && root.engine.installLine !== "" ? root.engine.installLine
@@ -397,6 +532,45 @@ Panel {
             }
           }
 
+          // What the button runs, and the way to Details. The sudo note
+          // stays here even while Details is closed.
+          Item {
+            visible: root.setupView && !root.showingDetails && root.hasDetails
+            width: parent.width
+            height: detailsLink.implicitHeight
+
+            Text {
+              anchors.left: parent.left
+              anchors.right: detailsLink.left
+              anchors.rightMargin: Style.spacing.lg
+              elide: Text.ElideRight
+              text: root.details.runs.length === 0 ? ""
+                : (root.details.sudo ? "asks for sudo \u00b7 " : "") + root.details.runs.length
+                  + (root.details.runs.length === 1 ? " step" : " steps")
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              textFormat: Text.PlainText
+            }
+
+            Text {
+              id: detailsLink
+              anchors.right: parent.right
+              text: "Details " + Model.GLYPHS.next
+              color: root.dimColor
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.underline: true
+              textFormat: Text.PlainText
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.detailsOpen = true
+              }
+            }
+          }
+
           // ------------------------------------------- network choice
           // Tailscale stays the recommended path; the home network is offered
           // quietly while Tailscale is missing or signed out, and in home-network
@@ -405,6 +579,7 @@ Panel {
             readonly property bool offerLan: !!root.engine && !root.engine.lanMode && root.step.alt !== undefined
             readonly property bool offerTailscale: !!root.engine && root.engine.lanMode
             visible: (offerLan || offerTailscale) && !root.showingQr && root.pairState !== "starting"
+              && !root.showingDetails
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             text: offerLan ? root.step.alt.label : "Use Tailscale instead (recommended)"
@@ -429,6 +604,7 @@ Panel {
 
           Column {
             visible: root.confirmSwitch && !!root.engine && root.engine.canCloseFirewall && root.engine.lanMode
+              && !root.showingDetails
             width: parent.width
             spacing: 4
 
@@ -437,7 +613,7 @@ Panel {
               wrapMode: Text.Wrap
               text: "The firewall is still open to " + (root.engine ? root.engine.checks.openSubnets.join(", ") : "")
                 + ". Close it before switching?"
-              color: Color.muted
+              color: root.dimColor
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
               textFormat: Text.PlainText
@@ -477,6 +653,7 @@ Panel {
           // ------------------------------------------------- paired phones
           Column {
             visible: root.engine && root.engine.paired && !root.showingQr && root.pairState !== "starting"
+              && !root.showingDetails
             width: parent.width
             spacing: Style.spacing.md
 
@@ -543,7 +720,7 @@ Panel {
           // ----------------------------------------------------- footer
           Item {
             visible: root.engine && root.engine.checked && root.engine.checks.hook.present
-              && !root.showingQr && root.pairState !== "starting"
+              && !root.showingQr && root.pairState !== "starting" && !root.showingDetails
             width: parent.width
             height: footerVersion.implicitHeight
 
@@ -576,7 +753,8 @@ Panel {
           }
 
           Text {
-            visible: root.engine && root.engine.canCloseFirewall && !root.confirmSwitch && !root.showingQr && root.pairState !== "starting"
+            visible: root.engine && root.engine.canCloseFirewall && !root.confirmSwitch && !root.showingQr
+              && root.pairState !== "starting" && !root.showingDetails
             width: parent.width
             text: "close the firewall again"
             color: Color.muted

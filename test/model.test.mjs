@@ -481,7 +481,7 @@ test("gate: verified key-only opens the firewall step, then the QR", () => {
   assert.equal(M.nextStep(checks, [], "lan").label, "Open firewall for your home network")
   assert.equal(M.canPair(checks, "lan"), true)
   assert.equal(M.nextStep(build({ lan_subnets: "192.168.1.0/24" }), [], "lan").kind, "pair")
-  assert.deepEqual(M.checklist(checks, "lan").find(r => r.id === "sshauth"), { id: "sshauth", label: "SSH sign-in", state: "ok", detail: "keys only" })
+  assert.deepEqual(M.checklist(checks, "lan").find(r => r.id === "sshauth"), { id: "sshauth", label: "SSH sign-in", state: "ok", detail: "keys only", chip: "keys only" })
 })
 
 test("gate: ufw off still needs key-only before the QR", () => {
@@ -954,4 +954,128 @@ test("a real sshd -T agrees: the drop-in's contents give exactly the four lines 
     writeFileSync(join(dir, "d/10-pocket-pair-keyonly.conf"), dropin)
     assert.equal(count(effective()), 4)
   } finally { rmSync(dir, { recursive: true }) }
+})
+
+// ---------------------------------------------------------------- panel words
+
+// The home-network note exactly as the panel showed it before it moved to the
+// Details page, written out so the move cannot change a word of it.
+const HOME_NOTE = "Home network works on the same Wi-Fi only. It opens SSH to your local network only (192.168.1.0/24),"
+  + " never to everyone, and only once SSH is verified to accept keys only (never passwords). If Pocket Pair cannot read or"
+  + " verify all of your SSH configuration, it stops and does not start or reload SSH. For access from anywhere, use Tailscale."
+const MATCH_PASSWORDS = conf("Port 22", "Match Address 192.168.1.0/24", "PasswordAuthentication yes")
+const view = (checks, mode, hosts = []) => {
+  const step = M.nextStep(checks, hosts, mode)
+  return { step, summary: M.stepSummary(step, checks, mode), details: M.stepDetails(step, checks, mode) }
+}
+
+test("summary: every step is a short title and one sentence", () => {
+  const cases = [
+    [build({ hook_path: "" }), "tailscale", "Install the Moshi helper"],
+    [build({ ts_status: "", ts_bin: "" }), "tailscale", "Connect with Tailscale"],
+    [build({ ssh_conf: PASSWORDS }), "lan", "SSH still accepts passwords"],
+    [build({}), "lan", "Open SSH to this Wi-Fi"],
+    [build({ mosh: "no" }), "tailscale", "Finish setup"],
+    [build({ lan_routes: "[]" }), "lan", "Waiting for a home network"],
+    [build({ ssh_conf: MATCH_PASSWORDS }), "lan", "SSH needs a look by hand"],
+    [build({}), "tailscale", "Ready to pair"],
+    [build({ lan_subnets: "192.168.1.0/24" }), "lan", "Ready to pair"]
+  ]
+  for (const [checks, mode, title] of cases) {
+    const { summary } = view(checks, mode)
+    assert.equal(summary.title, title)
+    assert.ok(summary.glyph.length > 0, title)
+    assert.ok(summary.line.length > 0 && summary.line.length <= 130, summary.line)
+  }
+  assert.equal(view(build({}), "tailscale", [{ id: "host_a" }]).summary.title, "Paired")
+})
+
+test("summary: the key-only sentence counts existing keys and says when the terminal does more", () => {
+  const line = over => view(build({ ssh_conf: PASSWORDS, ...over }), "lan").summary.line
+  assert.equal(line({}), "Turn them off so only keys can sign in. Your 2 existing keys keep working.")
+  assert.equal(line({ auth_keys: "1" }), "Turn them off so only keys can sign in. Your 1 existing key keeps working.")
+  assert.equal(line({ auth_keys: "0" }), "Turn them off so only keys can sign in.")
+  assert.match(line({ mosh: "no", sshd: "inactive" }), /The same terminal sets up what else is missing\.$/)
+  assert.match(view(build({}), "lan").summary.line, /^Only devices on 192\.168\.1\.0\/24 can reach SSH and Mosh/)
+})
+
+test("details: the key-only step keeps its notes, the home-network note and the terminal's lines word for word", () => {
+  const checks = build({ ssh_conf: PASSWORDS })
+  const { step, details } = view(checks, "lan")
+  assert.equal(step.label, "Make SSH keys-only")
+  assert.deepEqual(details.runs, step.fixes.map(M.fixPreview))
+  assert.deepEqual(details.why, [step.notes.join(" "), HOME_NOTE])
+  assert.equal(details.whyTitle, "WHY KEYS ONLY")
+  assert.equal(details.sudo, true)
+  assert.equal(details.undo, "To undo it: sudo rm " + DROPIN + " && sudo systemctl reload sshd")
+  // The terminal prints the same lines before it asks for the password.
+  const script = M.fixScript(step.fixes, "Pocket Pair will run:", step.notes)
+  for (const line of details.runs) assert.ok(script.includes("echo '  " + line + "'"), line)
+})
+
+test("details: firewall, Tailscale and review steps say what runs and why", () => {
+  const firewall = view(build({}), "lan")
+  assert.equal(firewall.step.label, "Open firewall for your home network")
+  assert.deepEqual(firewall.details.runs, firewall.step.fixes.map(M.fixPreview))
+  assert.deepEqual(firewall.details.why, [HOME_NOTE])
+  assert.equal(firewall.details.whyTitle, "HOME NETWORK")
+  assert.equal(firewall.details.sudo, true)
+  assert.equal(firewall.details.undo, "")
+
+  const tailscale = view(build({ ts_status: "", ts_bin: "" }), "tailscale")
+  assert.deepEqual(tailscale.details.runs, [
+    "$ sudo pacman -S tailscale", "$ sudo systemctl enable --now tailscaled", "$ sudo tailscale up"
+  ])
+  assert.deepEqual(tailscale.details.why, ["Recommended: reach this machine from anywhere, with no firewall changes."])
+  assert.equal(tailscale.details.whyTitle, "WHY")
+
+  const review = view(build({ ssh_conf: MATCH_PASSWORDS }), "lan")
+  assert.equal(review.step.kind, "wait")
+  assert.deepEqual(review.details.runs, [])
+  assert.equal(review.details.sudo, false)
+  assert.deepEqual(review.details.why, [review.step.hint, HOME_NOTE])
+  assert.match(review.details.why[0], /Needs a look: Match Address 192\.168\.1\.0\/24/)
+  assert.equal(review.details.whyTitle, "WHAT TO CHECK")
+})
+
+test("details: no network yet shows its message once; install, ready and paired have nothing to add", () => {
+  const waiting = view(build({ lan_routes: "[]" }), "lan")
+  assert.equal(waiting.summary.line, waiting.step.hint)
+  assert.deepEqual(waiting.details.why, [M.homeNetworkNote(build({ lan_routes: "[]" }))])
+  assert.match(waiting.details.why[0], /your local network only, never to everyone/)
+  const empty = { runs: [], sudo: false, whyTitle: "WHY", why: [], undo: "" }
+  assert.deepEqual(view(build({ hook_path: "" }), "tailscale").details, empty)
+  assert.deepEqual(view(build({}), "tailscale").details, empty)
+  assert.deepEqual(view(build({}), "tailscale", [{ id: "host_a" }]).details, empty)
+  assert.deepEqual(view(build({ lan_subnets: "192.168.1.0/24" }), "lan").details, { ...empty, whyTitle: "HOME NETWORK" })
+})
+
+test("home-network note and network line", () => {
+  assert.equal(M.homeNetworkNote(build({})), HOME_NOTE)
+  assert.equal(M.networkLine(build({}), "lan"), "Home network · 192.168.1.0/24")
+  assert.equal(M.networkLine(build({ lan_routes: "[]" }), "lan"), "Home network · not found")
+  assert.equal(M.networkLine(build({}), "tailscale"), "Tailscale · 100.64.0.1")
+  assert.equal(M.networkLine(build({ ts_status: "", ts_bin: "" }), "tailscale"), "Tailscale · not installed")
+  assert.equal(M.networkLine(build({ ts_status: status("Stopped") }), "tailscale"), "Tailscale · not connected")
+})
+
+test("chips: every check has a short label; SSH sign-in keeps the words the README quotes", () => {
+  for (const mode of ["tailscale", "lan"]) {
+    for (const over of [{}, { hook_path: "", mosh: "no", sshd: "inactive" }, { ssh_conf: PASSWORDS, auth_keys: "0" }]) {
+      for (const row of M.checklist(build(over), mode)) {
+        assert.equal(typeof row.chip, "string", row.id)
+        assert.ok(row.chip.length > 0 && row.chip.length <= 28, row.chip)
+      }
+    }
+  }
+  const chip = (id, over, mode = "lan") => M.checklist(build(over), mode).find(r => r.id === id).chip
+  assert.deepEqual(
+    [chip("sshauth", {}), chip("sshauth", { ssh_conf: PASSWORDS }), chip("sshauth", { ssh_conf: MATCH_PASSWORDS }), chip("sshauth", { ssh_conf: "" })],
+    ["keys only", "passwords on", "Match block: review by hand", "not verified: review by hand"])
+  assert.deepEqual([chip("sshkeys", { auth_keys: "1" }), chip("sshkeys", { auth_keys: "3" }), chip("sshkeys", { auth_keys: "0" }), chip("sshkeys", { auth_keys: "unknown" })],
+    ["1 key", "3 keys", "no keys yet", "keys not counted"])
+  assert.deepEqual([chip("firewall", {}), chip("firewall", { lan_subnets: "192.168.1.0/24" }), chip("firewall", { ufw: "inactive" })],
+    ["firewall closed", "firewall open", "no firewall"])
+  assert.deepEqual([chip("tsssh", {}, "tailscale"), chip("tsssh", { ts_prefs: '{"RunSSH": true}' }, "tailscale")],
+    ["Tailscale SSH off", "Tailscale SSH on"])
 })
