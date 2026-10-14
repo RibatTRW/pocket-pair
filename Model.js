@@ -8,9 +8,20 @@
 
 var GLYPHS = {
   phone: "",
-  ok: "●",
-  todo: "○",
-  wait: "◌"
+  // Nerd Font icons for the panel's status chips, step titles and Details.
+  check: "\u{f012c}",
+  cross: "\u{f0159}",
+  circle: "\u{f0766}",
+  next: "\u{f0142}",
+  back: "\u{f0141}",
+  lock: "\u{f023}",
+  key: "\u{f0306}",
+  wifi: "\u{f05a9}",
+  globe: "\u{f059f}",
+  qr: "\u{f0432}",
+  alert: "\u{f0026}",
+  download: "\u{f0b8f}",
+  console: "\u{f018d}"
 }
 
 var PAIR_SECONDS = 300
@@ -550,60 +561,75 @@ function pendingFixes(checks, mode) {
   return list
 }
 
-// The checklist the panel shows while something is still missing.
+function sshAuthDetail(ssh) {
+  return ssh.keyOnly ? "keys only"
+    : ssh.policy === "password" ? "passwords on"
+    : ssh.policy === "match" ? "Match block: review by hand" : "not verified: review by hand"
+}
+
+// The checklist behind the panel's status chips, shown while something is
+// still missing. `chip` is the row's short label on its chip.
 function checklist(checks, mode) {
   var rows = [{
     id: "hook", label: "moshi-hook",
     state: checks.hook.present ? "ok" : "todo",
-    detail: checks.hook.present ? checks.hook.version : "not installed"
+    detail: checks.hook.present ? checks.hook.version : "not installed",
+    chip: "helper"
   }]
   if (normalizeMode(mode) === MODE_LAN) {
     rows.push({
       id: "lan", label: "Home network",
       state: checks.lan.ok ? "ok" : "wait",
-      detail: checks.lan.ok ? checks.lan.subnet : "not found"
+      detail: checks.lan.ok ? checks.lan.subnet : "not found",
+      chip: "home network"
     })
   } else {
     var ts = checks.tailscale
     rows.push({
       id: "tailscale", label: "Tailscale",
       state: ts.state === "running" ? "ok" : "wait",
-      detail: ts.state === "running" ? ts.ip : ts.state === "missing" ? "not installed" : "not connected"
+      detail: ts.state === "running" ? ts.ip : ts.state === "missing" ? "not installed" : "not connected",
+      chip: "Tailscale"
     })
   }
   rows.push({
     id: "mosh", label: "mosh-server",
     state: checks.mosh ? "ok" : "todo",
-    detail: checks.mosh ? "installed" : "missing"
+    detail: checks.mosh ? "installed" : "missing",
+    chip: "mosh"
   })
   rows.push({
     id: "sshd", label: "SSH server",
     state: checks.sshd ? "ok" : "todo",
-    detail: checks.sshd ? "running" : "not running"
+    detail: checks.sshd ? "running" : "not running",
+    chip: "sshd"
   })
   if (normalizeMode(mode) === MODE_LAN) {
     rows.push({
       id: "sshauth", label: "SSH sign-in",
       state: checks.ssh.keyOnly ? "ok" : checks.ssh.policy === "password" ? "todo" : "wait",
-      detail: checks.ssh.keyOnly ? "keys only"
-        : checks.ssh.policy === "password" ? "passwords on"
-        : checks.ssh.policy === "match" ? "Match block: review by hand" : "not verified: review by hand"
+      detail: sshAuthDetail(checks.ssh),
+      chip: sshAuthDetail(checks.ssh)
     })
     rows.push({
       id: "sshkeys", label: "Authorized keys",
       state: "ok",
-      detail: checks.ssh.keys > 0 ? checks.ssh.keys + " already" : checks.ssh.keys === 0 ? "none yet" : "not counted"
+      detail: checks.ssh.keys > 0 ? checks.ssh.keys + " already" : checks.ssh.keys === 0 ? "none yet" : "not counted",
+      chip: checks.ssh.keys > 0 ? checks.ssh.keys + (checks.ssh.keys === 1 ? " key" : " keys")
+        : checks.ssh.keys === 0 ? "no keys yet" : "keys not counted"
     })
     rows.push({
       id: "firewall", label: "Firewall",
       state: checks.ufw !== "active" || checks.firewallOpen ? "ok" : checks.lan.ok && checks.ssh.keyOnly ? "todo" : "wait",
-      detail: checks.ufw !== "active" ? "not in use" : checks.firewallOpen ? "open to your network" : "closed"
+      detail: checks.ufw !== "active" ? "not in use" : checks.firewallOpen ? "open to your network" : "closed",
+      chip: checks.ufw !== "active" ? "no firewall" : checks.firewallOpen ? "firewall open" : "firewall closed"
     })
   } else {
     rows.push({
       id: "tsssh", label: "Tailscale SSH",
       state: checks.tailscale.ssh === true ? "todo" : "ok",
-      detail: checks.tailscale.ssh === true ? "on" : "off"
+      detail: checks.tailscale.ssh === true ? "on" : "off",
+      chip: checks.tailscale.ssh === true ? "Tailscale SSH on" : "Tailscale SSH off"
     })
   }
   return rows
@@ -692,6 +718,89 @@ function fixScript(fixes, heading, notes) {
   return parts.join("; ")
 }
 
+// The panel's main page says each step in a short title and one sentence;
+// everything longer (the steps that run, the step's own note, the home-network
+// note) is on its Details page, word for word. `glyph` heads the title.
+function stepSummary(step, checks, mode) {
+  var lan = normalizeMode(mode) === MODE_LAN
+  var ids = (step.fixes || []).map(function(fix) { return fix.id })
+  var has = function(id) { return ids.indexOf(id) >= 0 }
+  var others = ids.some(function(id) { return id.indexOf("ssh-") !== 0 })
+  if (step.kind === "install") {
+    return { title: "Install the Moshi helper", glyph: GLYPHS.download,
+      line: "Downloads moshi-hook, checks its SHA-256 and starts it. No password needed." }
+  }
+  if (has("ts-up")) {
+    return { title: "Connect with Tailscale", glyph: GLYPHS.globe,
+      line: "Reach this computer from anywhere, with no firewall changes." }
+  }
+  if (has("ssh-conf")) {
+    var keys = checks.ssh.keys
+    return { title: "SSH still accepts passwords", glyph: GLYPHS.key,
+      line: "Turn them off so only keys can sign in."
+        + (keys > 0 ? " Your " + keys + (keys === 1 ? " existing key keeps" : " existing keys keep") + " working." : "")
+        + (others ? " The same terminal sets up what else is missing." : "") }
+  }
+  if (step.kind === "fix" && ids.every(function(id) { return id.indexOf("fw-") === 0 })) {
+    return { title: "Open SSH to this Wi-Fi", glyph: GLYPHS.wifi,
+      line: "Only devices on " + checks.lan.subnet + " can reach SSH and Mosh, and only with a key." }
+  }
+  if (step.kind === "fix") {
+    return { title: "Finish setup", glyph: GLYPHS.console,
+      line: "One terminal sets up what is missing, then asks for your password." }
+  }
+  if (step.kind === "wait" && lan && !checks.lan.ok) {
+    return { title: "Waiting for a home network", glyph: GLYPHS.wifi, line: step.hint || "" }
+  }
+  if (step.kind === "wait" && lan) {
+    return { title: "SSH needs a look by hand", glyph: GLYPHS.alert,
+      line: "A setting Pocket Pair cannot verify could allow passwords, so it will not start or reload SSH." }
+  }
+  if (step.kind === "pair") {
+    return { title: "Ready to pair", glyph: GLYPHS.qr,
+      line: lan ? "SSH accepts keys only. Put your phone on this Wi-Fi, open Moshi, then show the code."
+        : "Open Moshi on your phone, then show the code." }
+  }
+  if (step.kind === "done") return { title: "Paired", glyph: GLYPHS.phone, line: "" }
+  return { title: "Checking this computer", glyph: GLYPHS.circle, line: step.hint || "" }
+}
+
+// The hero's subtitle: which network the phone pairs over, and its address.
+function networkLine(checks, mode) {
+  if (normalizeMode(mode) === MODE_LAN) return "Home network \u00b7 " + (checks.lan.ok ? checks.lan.subnet : "not found")
+  var ts = checks.tailscale
+  return "Tailscale \u00b7 " + (ts.state === "running" ? ts.ip : ts.state === "missing" ? "not installed" : "not connected")
+}
+
+// What the home-network mode does and refuses to do, shown with every
+// home-network step.
+function homeNetworkNote(checks) {
+  return "Home network works on the same Wi-Fi only. It opens SSH to your local network only"
+    + (checks.lan.ok ? " (" + checks.lan.subnet + ")" : "")
+    + ", never to everyone, and only once SSH is verified to accept keys only (never passwords). If Pocket Pair cannot read or verify all of your SSH configuration, it stops and does not start or reload SSH. For access from anywhere, use Tailscale."
+}
+
+// The Details page. `runs` are the same preview lines the terminal prints
+// before the password prompt; `why` is the step's own note, plus the
+// home-network note while that mode is being set up; `undo` says how to take the key-only file
+// back out. Nothing here is shortened: the main page carries the short words.
+function stepDetails(step, checks, mode) {
+  var lan = normalizeMode(mode) === MODE_LAN
+  var fixes = step.fixes || []
+  var keyOnly = fixes.some(function(fix) { return fix.id === "ssh-conf" })
+  // Waiting for a home network already shows its hint as the main sentence.
+  var hint = step.hint !== undefined && step.hint !== "" && !(step.kind === "wait" && lan && !checks.lan.ok)
+  var why = hint ? [step.hint] : []
+  if (lan && step.kind !== "pair" && step.kind !== "done") why.push(homeNetworkNote(checks))
+  return {
+    runs: fixes.map(fixPreview),
+    sudo: fixes.some(function(fix) { return /(^|[^a-z])sudo /.test(fix.cmd) }),
+    whyTitle: keyOnly ? "WHY KEYS ONLY" : hint && step.kind === "wait" ? "WHAT TO CHECK" : lan ? "HOME NETWORK" : "WHY",
+    why: why,
+    undo: keyOnly ? "To undo it: sudo rm " + SSH_DROPIN + " && sudo systemctl reload sshd" : ""
+  }
+}
+
 // `moshi-hook host list`: id, user@host:port, SHA256 fingerprint, status,
 // separated by runs of spaces.
 function parseHostList(text) {
@@ -770,6 +879,7 @@ if (typeof module !== "undefined") {
     buildChecks: buildChecks, pendingFixes: pendingFixes, checklist: checklist,
     nextStep: nextStep, fixScript: fixScript, parseHostList: parseHostList,
     isHostId: isHostId, parseSetupLine: parseSetupLine, parseQrAscii: parseQrAscii,
-    formatCountdown: formatCountdown, scrub: scrub
+    formatCountdown: formatCountdown, scrub: scrub,
+    stepSummary: stepSummary, stepDetails: stepDetails, networkLine: networkLine, homeNetworkNote: homeNetworkNote
   }
 }
