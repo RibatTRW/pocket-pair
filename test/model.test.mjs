@@ -97,6 +97,25 @@ test("host list parses and rejects odd ids", () => {
   assert.equal(M.isHostId("host_a b"), false)
 })
 
+// `host revoke` keeps the pairing in `host list` with the status "revoked", so
+// a revoked row must leave the list (and the paired count) once it is revoked.
+test("revoked pairings are not paired phones", () => {
+  const row = (id, target, status) => `host_0f1e:${id}  ${target}  SHA256:FAKE${id}  ${status}`
+  const before = [
+    row("Ab3d", "demo@omarchy-demo.ts.net:22", "revoked"),
+    row("Kq7R", "demo@omarchy-demo.ts.net:22", "active"),
+    row("Wx5Y", "demo@100.64.0.7:22", "active")
+  ]
+  assert.deepEqual(M.parseHostList(before.join("\n")).map(h => h.id), ["host_0f1e:Kq7R", "host_0f1e:Wx5Y"])
+  assert.ok(M.isHostId("host_0f1e:Kq7R"))
+
+  const after = before.map(line => line.includes(":Kq7R ") ? line.replace(/active$/, "revoked") : line)
+  assert.deepEqual(M.parseHostList(after.join("\n")).map(h => h.id), ["host_0f1e:Wx5Y"])
+  assert.deepEqual(M.parseHostList(after.map(line => line.replace(/active$/, "Revoked")).join("\n")), [])
+  // An older list without the status column still counts as paired.
+  assert.equal(M.parseHostList("host_0f1e:Ab3d  demo@box:22  SHA256:FAKE").length, 1)
+})
+
 test("setup lines", () => {
   assert.equal(M.parseSetupLine("not json"), null)
   const pending = M.parseSetupLine('{"status":"pending","deepLink":"moshi://x"}')
