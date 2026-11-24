@@ -802,12 +802,14 @@ function stepDetails(step, checks, mode) {
 }
 
 // `moshi-hook host list`: id, user@host:port, SHA256 fingerprint, status,
-// separated by runs of spaces.
+// separated by runs of spaces. `host revoke` keeps the pairing in the list as
+// "revoked", so only the rest are paired phones.
 function parseHostList(text) {
   var hosts = []
   String(text || "").split(/\r?\n/).forEach(function(line) {
     var cols = line.trim().split(/\s+/)
     if (cols.length < 3 || !isHostId(cols[0])) return
+    if (String(cols[3] || "").toLowerCase() === "revoked") return
     hosts.push({ id: cols[0], target: cols[1], fingerprint: cols[2], status: cols[3] || "" })
   })
   return hosts

@@ -170,7 +170,7 @@ The panel runs `moshi-hook host setup --json --host <your Tailscale or home-netw
 
 ### Revoke
 
-Removes the phone's key from `~/.ssh/authorized_keys` with `moshi-hook host revoke`.
+Press the trash can next to a phone, then the tick to confirm. This removes the phone's key from `~/.ssh/authorized_keys` with `moshi-hook host revoke`. `moshi-hook host list` keeps a revoked pairing with the status `revoked`; Pocket Pair does not show those rows, so the phone leaves the list. A revoked pairing does not count as paired: with none left, the bar glyph stops using the theme accent and the panel offers pairing again.
 
 ## Settings
 
